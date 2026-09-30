@@ -2,6 +2,7 @@ package ai
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -879,11 +880,9 @@ type AssistantMessage struct {
 	// here any more than it does in pi (pi c3e7bc60a `endTurn?`). A pointer
 	// because pi distinguishes an explicit false from an absent field.
 	//
-	// Nothing in this port writes it: the only provider that does is pi's
-	// openai-codex-responses, which is deliberately not ported. It is carried
-	// anyway because session files and the server wire are shared with pi
-	// proper — a session pi wrote must round-trip through here without losing
-	// the field — the same reason ToolResultMessage.Usage is carried.
+	// The bounded Codex SSE adapter does not yet derive EndTurn. It is carried
+	// so session files and server wire can round-trip messages pi wrote without
+	// losing the field.
 	EndTurn   *bool `json:"endTurn,omitempty"`
 	Timestamp int64 `json:"timestamp"`
 }
@@ -1242,6 +1241,10 @@ type ProviderRequestOptions struct {
 	// back to telemetry.NoopContext themselves.
 	TelemetryContext telemetry.Context
 	APIKey           string
+	// CodexAuth resolves request-scoped router-owned OAuth auth. Codex never
+	// falls back to APIKey or environment credentials and never refreshes tokens.
+	// The caller owns refresh, persistence and account selection.
+	CodexAuth func(context.Context) (ModelAuth, error)
 	// OnPayload inspects or replaces a provider payload before it is sent.
 	// Returning a nil payload keeps it unchanged.
 	OnPayload func(payload any, model *Model) (any, error)

@@ -53,7 +53,12 @@ type SessionOptions struct {
 	SystemPrompt  string
 	ThinkingLevel agent.ThinkingLevel
 	APIKey        string
-	SessionID     string
+	// CodexAuth supplies request-scoped OAuth auth for Codex only. No APIKey fallback.
+	// The host owns refresh and persistence; credentials never enter history.
+	CodexAuth func(context.Context) (ai.ModelAuth, error)
+	SessionID string
+	// OrderedPersistence is an optional checked host-owned transaction boundary.
+	OrderedPersistence OrderedPersistence
 
 	// TrustProject enables discovery of project-local resources under
 	// <cwd>/.pi — currently the skills directory. It is pi's isProjectTrusted()
@@ -102,6 +107,12 @@ type SessionOptions struct {
 	// error tool result). This is the native equivalent of pi's tool_call
 	// extension hook — use it for permission gates, path protection, etc.
 	BeforeToolCall func(ctx context.Context, c agent.BeforeToolCallContext) *agent.BeforeToolCallResult
+	// BeforeToolExecute admits host-owned durable intent before external Execute.
+	// An error terminates the run, not a tool result. The host owns transactions
+	// and fencing; use BeforeToolCall for ordinary permission denials.
+	BeforeToolExecute func(ctx context.Context, c agent.BeforeToolCallContext) error
+	// ReplayToolResult may return a complete saved result only after admission.
+	ReplayToolResult func(ctx context.Context, c agent.BeforeToolCallContext) (*ai.ToolResultMessage, error)
 	// AfterToolCall runs after a tool finishes; return overrides for the result.
 	AfterToolCall func(ctx context.Context, c agent.AfterToolCallContext) *agent.AfterToolCallResult
 
@@ -289,12 +300,14 @@ func toolPromptGuidelines(tools []agent.AgentTool) map[string][]string {
 // Session is a coding-agent session: an Agent wired with a model, tools, and the
 // coding system prompt.
 type Session struct {
-	Agent    *agent.Agent
-	Model    *ai.Model
-	Cwd      string
-	Recorder *SessionRecorder
-	apiKey   string
-	models   ai.Models
+	Agent     *agent.Agent
+	Model     *ai.Model
+	Cwd       string
+	Recorder  *SessionRecorder
+	apiKey    string
+	models    ai.Models
+	sessionID string
+	ordered   OrderedPersistence
 	// recMu guards Recorder against the tool-execution goroutine reading it for
 	// bash session metadata while Record attaches one.
 	recMu sync.RWMutex
@@ -474,7 +487,7 @@ func NewSession(opts SessionOptions) *Session {
 	// reads them off the live ExtensionContext per call). The Session is
 	// allocated up front so the closure captures a stable, non-nil pointer; its
 	// Agent is filled in below, before NewSession returns and any tool can run.
-	sess := &Session{Cwd: cwd, Model: opts.Model, apiKey: opts.APIKey, models: opts.Models}
+	sess := &Session{Cwd: cwd, Model: opts.Model, apiKey: opts.APIKey, models: opts.Models, sessionID: opts.SessionID, ordered: opts.OrderedPersistence}
 	tools := resolveTools(cwd, opts, sess.bashSessionEnv, sess.imageResizeOptions)
 	// A custom SystemPrompt still goes through the prompt builder with discovery:
 	// pi adds project context files, skills and cwd to custom prompts too; only
@@ -523,28 +536,34 @@ func NewSession(opts SessionOptions) *Session {
 			Model:         opts.Model,
 			ThinkingLevel: thinking,
 		},
-		StreamFn:        sessionStreamFn(opts.StreamFn),
-		SessionID:       opts.SessionID,
-		GetApiKey:       func(provider string) string { return opts.APIKey },
-		Temperature:     opts.Temperature,
-		MaxTokens:       opts.MaxTokens,
-		CacheRetention:  opts.CacheRetention,
-		MaxRetries:      opts.MaxRetries,
-		TimeoutMs:       opts.TimeoutMs,
-		MaxRetryDelayMs: opts.MaxRetryDelayMs,
-		Transport:       opts.Transport,
-		ThinkingBudgets: opts.ThinkingBudgets,
-		Headers:         opts.Headers,
-		OnPayload:       opts.OnPayload,
-		OnResponse:      opts.OnResponse,
-		BeforeToolCall:  opts.BeforeToolCall,
-		AfterToolCall:   withToolResultImageNormalization(opts.AfterToolCall, sess.imageResizeOptions),
+		StreamFn:          sessionStreamFn(opts.StreamFn),
+		SessionID:         opts.SessionID,
+		GetApiKey:         func(provider string) string { return opts.APIKey },
+		CodexAuth:         opts.CodexAuth,
+		Temperature:       opts.Temperature,
+		MaxTokens:         opts.MaxTokens,
+		CacheRetention:    opts.CacheRetention,
+		MaxRetries:        opts.MaxRetries,
+		TimeoutMs:         opts.TimeoutMs,
+		MaxRetryDelayMs:   opts.MaxRetryDelayMs,
+		Transport:         opts.Transport,
+		ThinkingBudgets:   opts.ThinkingBudgets,
+		Headers:           opts.Headers,
+		OnPayload:         opts.OnPayload,
+		OnResponse:        opts.OnResponse,
+		BeforeToolCall:    opts.BeforeToolCall,
+		BeforeToolExecute: opts.BeforeToolExecute,
+		ReplayToolResult:  opts.ReplayToolResult,
+		AfterToolCall:     withToolResultImageNormalization(opts.AfterToolCall, sess.imageResizeOptions),
 
 		// pi's createAgentSession wires the extension runner's
 		// provider_stream_event handler here, beside onPayload/onResponse.
 		OnProviderStreamEvent: opts.OnProviderStreamEvent,
 	})
 
+	if opts.OrderedPersistence != nil {
+		a.BeforeMessageEnd = opts.OrderedPersistence.AppendMessage
+	}
 	a.SetTools(tools)
 	sess.Agent = a
 	sess.installTransformContext()

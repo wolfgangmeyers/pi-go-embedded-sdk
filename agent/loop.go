@@ -32,6 +32,16 @@ func streamSimpleTranscript(ctx context.Context, model *ai.Model, req ai.Transcr
 // recovered at the run boundary (in agent.go) or in the low-level goroutine.
 type emitPanic struct{ err error }
 
+// toolAdmissionAbort is distinct from a permission denial or tool error. It
+// unwinds to Agent's failure boundary without publishing a tool result.
+type toolAdmissionAbort struct{ err error }
+
+// PolicyDenial is a host policy rejection before durable effect intent. Only
+// BeforeToolExecute may return it; all other admission failures remain fatal.
+type PolicyDenial struct{ Reason string }
+
+func (d *PolicyDenial) Error() string { return d.Reason }
+
 // mustEmit emits an event and unwinds the loop (via panic) if the sink returns
 // an error, matching pi's "await emit(...)" throwing on a rejected listener.
 func mustEmit(emit EventSink, e AgentEvent) {
@@ -323,6 +333,7 @@ func streamAssistantResponse(ctx context.Context, agentCtx *AgentContext, config
 		StreamOptions: ai.StreamOptions{
 			ProviderRequestOptions: ai.ProviderRequestOptions{
 				APIKey:          apiKey,
+				CodexAuth:       config.CodexAuth,
 				OnPayload:       config.OnPayload,
 				OnResponse:      config.OnResponse,
 				MaxRetryDelayMs: config.MaxRetryDelayMs,
@@ -538,6 +549,7 @@ type finalizedOutcome struct {
 	toolCall ai.ToolCall
 	result   AgentToolResult
 	isError  bool
+	replay   *ai.ToolResultMessage
 }
 
 func shouldTerminateBatch(calls []finalizedOutcome) bool {
@@ -563,6 +575,8 @@ func executeToolCallsSequential(ctx context.Context, current *AgentContext, msg 
 		var fo finalizedOutcome
 		if prep.immediate != nil {
 			fo = finalizedOutcome{toolCall: tc, result: prep.immediate.result, isError: prep.immediate.isError}
+		} else if prep.replay != nil {
+			fo = finalizedOutcome{toolCall: tc, result: AgentToolResult{Content: prep.replay.Content, Details: prep.replay.Details}, isError: prep.replay.IsError, replay: prep.replay}
 		} else {
 			executed := executePreparedToolCall(ctx, *prep.prepared, emit)
 			fo = finalizeExecutedToolCall(ctx, current, msg, *prep.prepared, executed, config)
@@ -617,6 +631,12 @@ func executeToolCallsParallel(ctx context.Context, current *AgentContext, msg *a
 			if aborted(ctx) {
 				break
 			}
+			continue
+		}
+		if prep.replay != nil {
+			fo := finalizedOutcome{toolCall: tc, result: AgentToolResult{Content: prep.replay.Content, Details: prep.replay.Details}, isError: prep.replay.IsError, replay: prep.replay}
+			emitToolExecutionEnd(fo, safeEmit)
+			slots = append(slots, slot{immediate: &fo})
 			continue
 		}
 		prepared := *prep.prepared
@@ -736,6 +756,7 @@ type preparedToolCall struct {
 type prepareResult struct {
 	immediate *immediateOutcome
 	prepared  *preparedToolCall
+	replay    *ai.ToolResultMessage
 }
 
 func prepareToolCall(ctx context.Context, current *AgentContext, msg *ai.AssistantMessage, tc ai.ToolCall, config AgentLoopConfig) (res prepareResult) {
@@ -751,6 +772,9 @@ func prepareToolCall(ctx context.Context, current *AgentContext, msg *ai.Assista
 		if r := recover(); r != nil {
 			if ep, ok := r.(emitPanic); ok {
 				panic(ep)
+			}
+			if abort, ok := r.(toolAdmissionAbort); ok {
+				panic(abort)
 			}
 			res = prepareResult{immediate: &immediateOutcome{result: errorToolResult(panicMessage(r)), isError: true}}
 		}
@@ -794,6 +818,44 @@ func prepareToolCall(ctx context.Context, current *AgentContext, msg *ai.Assista
 	}
 	if aborted(ctx) {
 		return prepareResult{immediate: &immediateOutcome{result: errorToolResult("Operation aborted"), isError: true}}
+	}
+	if config.BeforeToolExecute != nil {
+		// Keep admission outside tool Execute's error-to-result conversion.
+		// Only a typed pre-intent policy denial may continue as a checked result.
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					if abort, ok := r.(toolAdmissionAbort); ok {
+						panic(abort)
+					}
+					panic(toolAdmissionAbort{err: fmt.Errorf("intent admission panicked: %s", panicMessage(r))})
+				}
+			}()
+			if err := config.BeforeToolExecute(ctx, BeforeToolCallContext{AssistantMessage: msg, ToolCall: prepared, Args: validated, Context: current}); err != nil {
+				var denial *PolicyDenial
+				if errors.As(err, &denial) && denial != nil && !aborted(ctx) {
+					res = prepareResult{immediate: &immediateOutcome{result: errorToolResult(denial.Error()), isError: true}}
+					return
+				}
+				panic(toolAdmissionAbort{err: err})
+			}
+		}()
+		if res.immediate != nil {
+			return res
+		}
+	}
+	if config.ReplayToolResult != nil && !aborted(ctx) {
+		// Only an admitted, schema-valid call may request a saved complete result.
+		replay, err := config.ReplayToolResult(ctx, BeforeToolCallContext{AssistantMessage: msg, ToolCall: prepared, Args: validated, Context: current})
+		if err != nil {
+			panic(toolAdmissionAbort{err: err})
+		}
+		if replay != nil {
+			if replay.MessageRole() != ai.RoleToolResult || replay.ToolCallID == "" || replay.ToolCallID != tc.ID || replay.ToolName != tc.Name || replay.Content == nil || replay.Timestamp <= 0 {
+				panic(toolAdmissionAbort{err: errors.New("invalid saved tool result for admitted call")})
+			}
+			return prepareResult{replay: replay}
+		}
 	}
 	return prepareResult{prepared: &preparedToolCall{toolCall: tc, tool: tool, args: validated}}
 }
@@ -936,6 +998,9 @@ func emitToolExecutionEnd(fo finalizedOutcome, emit EventSink) {
 }
 
 func createToolResultMessage(fo finalizedOutcome) ai.ToolResultMessage {
+	if fo.replay != nil {
+		return *fo.replay
+	}
 	return ai.ToolResultMessage{
 		ToolCallID: fo.toolCall.ID,
 		ToolName:   fo.toolCall.Name,

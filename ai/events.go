@@ -20,6 +20,18 @@ const (
 	EventError         EventType = "error"
 )
 
+// FailureKind is an in-process cause on a terminal error event. It is not
+// serialized and is not a general retry policy: only the router can decide
+// whether a new turn with refreshed credentials is safe.
+type FailureKind uint8
+
+const (
+	FailureUnknown FailureKind = iota
+	// FailureCodexPreOutputUnauthorized means the Codex HTTP response itself
+	// was 401 before any EventStart. It does not describe SSE failures.
+	FailureCodexPreOutputUnauthorized
+)
+
 // AssistantMessageEvent is one event in the streaming protocol. It is a flat
 // struct (Go has no discriminated unions) carrying the union of fields used by
 // the variants documented in pi's AssistantMessageEvent.
@@ -58,6 +70,8 @@ const (
 // both sides; only a deferred read differs.
 type AssistantMessageEvent struct {
 	Type EventType `json:"type"`
+	// FailureKind is only available to an in-process StreamFn consumer.
+	FailureKind FailureKind `json:"-"`
 	// ContentIndex is set for per-block events (text/thinking/toolcall). pi marks
 	// it required on those events (types.ts:360-368); no omitempty so index 0 is
 	// not dropped on serialize.

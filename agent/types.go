@@ -281,6 +281,7 @@ type AgentLoopConfig struct {
 	Headers                   ai.ProviderHeaders
 	Metadata                  map[string]any
 	APIKey                    string
+	CodexAuth                 func(context.Context) (ai.ModelAuth, error)
 	OnPayload                 func(payload any, model *ai.Model) (any, error)
 	OnResponse                func(resp ai.ProviderResponse, model *ai.Model) error
 	// OnProviderStreamEvent is forwarded to the stream options as
@@ -300,8 +301,10 @@ type AgentLoopConfig struct {
 	// GetApiKey resolves an API key per call (for expiring OAuth tokens).
 	GetApiKey func(provider string) string
 
-	BeforeToolCall func(ctx context.Context, c BeforeToolCallContext) *BeforeToolCallResult
-	AfterToolCall  func(ctx context.Context, c AfterToolCallContext) *AfterToolCallResult
+	BeforeToolCall    func(ctx context.Context, c BeforeToolCallContext) *BeforeToolCallResult
+	BeforeToolExecute func(ctx context.Context, c BeforeToolCallContext) error
+	ReplayToolResult  func(ctx context.Context, c BeforeToolCallContext) (*ai.ToolResultMessage, error)
+	AfterToolCall     func(ctx context.Context, c AfterToolCallContext) *AfterToolCallResult
 	// FinishTurn is called after the assistant message and all tool-result
 	// messages have been emitted, immediately before turn_end. TurnEnd ends the
 	// run without polling the queues or preparing another request. On a normal

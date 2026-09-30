@@ -17,6 +17,7 @@ func RegisterBuiltins() {
 	RegisterAnthropic()
 	RegisterOpenAICompletions()
 	RegisterOpenAIResponses()
+	RegisterOpenAICodexResponses()
 	RegisterGoogle()
 	RegisterPiMessages()
 }
