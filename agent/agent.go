@@ -548,6 +548,14 @@ func (a *Agent) loopConfig(skipInitialSteeringPoll bool) AgentLoopConfig {
 		FinishTurn:                a.FinishTurn,
 		PrepareRequest:            a.PrepareRequest,
 		PrepareNextTurn:           a.PrepareNextTurn,
+		HasSteeringMessages: func() bool {
+			a.mu.Lock()
+			defer a.mu.Unlock()
+			if skip {
+				return false
+			}
+			return a.steeringQueue.hasItems()
+		},
 		GetSteeringMessages: func() []AgentMessage {
 			a.mu.Lock()
 			defer a.mu.Unlock()

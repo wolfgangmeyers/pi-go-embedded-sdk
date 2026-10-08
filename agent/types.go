@@ -378,6 +378,9 @@ type AgentLoopConfig struct {
 	// may be long-running (compaction); steering queued while it runs is picked
 	// up before the turn starts.
 	PrepareNextTurn func(c AgentTurnContext) *AgentLoopTurnUpdate
+	// HasSteeringMessages reports whether any steering messages are currently
+	// queued to be injected.
+	HasSteeringMessages func() bool
 	// GetSteeringMessages returns steering messages to inject mid-run. It is
 	// polled after the current assistant turn finishes executing its tool
 	// calls, unless FinishTurn ends the run.

@@ -530,6 +530,27 @@ func failToolCallsFromTruncatedMessage(toolCalls []ai.ToolCall, emit EventSink) 
 
 func executeToolCalls(ctx context.Context, current *AgentContext, msg *ai.AssistantMessage, config AgentLoopConfig, emit EventSink) executedBatch {
 	toolCalls := filterToolCalls(msg)
+	if config.HasSteeringMessages != nil && config.HasSteeringMessages() {
+		var finalized []AgentToolCallOutcome
+		var messages []ai.ToolResultMessage
+		for _, tc := range toolCalls {
+			mustEmit(emit, AgentEvent{Type: EvToolExecutionStart, ToolCallID: tc.ID, ToolName: tc.Name, Args: tc.Arguments})
+			fo := AgentToolCallOutcome{
+				ToolCall: tc,
+				Result: errorToolResult(fmt.Sprintf(
+					`Tool call "%s" was not executed: interrupted by user steering message.`,
+					tc.Name,
+				)),
+				IsError: true,
+			}
+			emitToolExecutionEnd(fo, emit)
+			trm := createToolResultMessage(fo)
+			emitToolResultMessage(trm, emit)
+			finalized = append(finalized, fo)
+			messages = append(messages, trm)
+		}
+		return executedBatch{messages: messages, terminate: false}
+	}
 	hasSequential := false
 	for _, tc := range toolCalls {
 		if t, ok := findTool(current.Tools, tc.Name); ok && t.ExecutionMode == ToolSequential {
@@ -559,7 +580,34 @@ func executeToolCallsSequential(ctx context.Context, current *AgentContext, msg 
 	var finalized []AgentToolCallOutcome
 	var messages []ai.ToolResultMessage
 
-	for _, tc := range toolCalls {
+	hasSteering := func() bool {
+		if config.HasSteeringMessages != nil {
+			return config.HasSteeringMessages()
+		}
+		return false
+	}
+
+	for i, tc := range toolCalls {
+		if hasSteering() {
+			for _, remaining := range toolCalls[i:] {
+				mustEmit(emit, AgentEvent{Type: EvToolExecutionStart, ToolCallID: remaining.ID, ToolName: remaining.Name, Args: remaining.Arguments})
+				fo := AgentToolCallOutcome{
+					ToolCall: remaining,
+					Result: errorToolResult(fmt.Sprintf(
+						`Tool call "%s" was not executed: interrupted by user steering message.`,
+						remaining.Name,
+					)),
+					IsError: true,
+				}
+				emitToolExecutionEnd(fo, emit)
+				trm := createToolResultMessage(fo)
+				emitToolResultMessage(trm, emit)
+				finalized = append(finalized, fo)
+				messages = append(messages, trm)
+			}
+			break
+		}
+
 		mustEmit(emit, AgentEvent{Type: EvToolExecutionStart, ToolCallID: tc.ID, ToolName: tc.Name, Args: tc.Arguments})
 
 		prep := prepareToolCall(ctx, current, msg, tc, config.toolCallHooks(), current.Tools)
