@@ -259,3 +259,53 @@ func TestSteeringBeforeToolExecutionSkipsAllToolsAndInvokesModel(t *testing.T) {
 		t.Fatalf("expected resB to be skipped, got: %+v", resB)
 	}
 }
+
+func TestSteeredMessageInvokingToolDoesNotAbortItself(t *testing.T) {
+	var subagentCalled atomic.Bool
+
+	subagentTool := AgentTool{
+		Name:          "subagent",
+		Description:   "Launch subagent",
+		Parameters:    ai.Object(),
+		ExecutionMode: ToolSequential,
+		Execute: func(ctx context.Context, id string, params map[string]any, onUpdate ToolUpdateFunc) (AgentToolResult, error) {
+			subagentCalled.Store(true)
+			return AgentToolResult{Content: ai.ContentList{ai.TextContent{Text: "subagent started"}}}, nil
+		},
+	}
+
+	turn1 := textMessage("Initial work before steering")
+	turn2 := assistantWithToolList(ai.ToolCall{ID: "call_subagent", Name: "subagent", Arguments: map[string]any{"task": "fix UI"}})
+	turn3 := textMessage("Subagent finished and work is complete")
+
+	var requests []ai.TranscriptContext
+	scripted := scriptedStream(turn1, turn2, turn3)
+
+	var a *Agent
+	streamFn := func(ctx context.Context, model *ai.Model, req ai.TranscriptContext, opts *ai.SimpleStreamOptions) *ai.AssistantMessageEventStream {
+		requests = append(requests, req)
+		if len(requests) == 1 {
+			// User steers mid-stream with subagent guidance (simulate duplicate steer as well)
+			a.Steer(ai.NewUserText("Important: Subagent Guidance: Use subagents for your work", 0))
+			a.Steer(ai.NewUserText("Important: Subagent Guidance: Use subagents for your work", 0))
+		}
+		return scripted(ctx, model, req, opts)
+	}
+
+	a = NewAgent(AgentOptions{
+		InitialState: &AgentState{
+			Model: testModel,
+			Tools: []AgentTool{subagentTool},
+		},
+		StreamFn: streamFn,
+	})
+
+	if err := a.Prompt(context.Background(), "initial task"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if !subagentCalled.Load() {
+		t.Fatal("expected subagent tool to be executed, but it was skipped/aborted as interrupted!")
+	}
+}
+
