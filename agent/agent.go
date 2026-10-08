@@ -130,8 +130,10 @@ type Agent struct {
 	state            AgentState
 	listeners        []Listener
 
-	steeringQueue pendingQueue
-	followUpQueue pendingQueue
+	steeringQueue             pendingQueue
+	steeringCounter           uint64
+	checkpointSteeringCounter uint64
+	followUpQueue             pendingQueue
 
 	ConvertToLlm     func(messages []AgentMessage) []ai.Message
 	TransformContext func(ctx context.Context, messages []AgentMessage) []AgentMessage
@@ -309,13 +311,23 @@ func (a *Agent) SetMessages(messages []AgentMessage) {
 }
 
 // Steer queues a message to inject after the current assistant turn finishes.
-func (a *Agent) Steer(m AgentMessage) { a.mu.Lock(); a.steeringQueue.enqueue(m); a.mu.Unlock() }
+func (a *Agent) Steer(m AgentMessage) {
+	a.mu.Lock()
+	a.steeringQueue.enqueue(m)
+	a.steeringCounter++
+	a.mu.Unlock()
+}
 
 // FollowUp queues a message to run after the agent would otherwise stop.
 func (a *Agent) FollowUp(m AgentMessage) { a.mu.Lock(); a.followUpQueue.enqueue(m); a.mu.Unlock() }
 
 // ClearSteeringQueue removes all queued steering messages.
-func (a *Agent) ClearSteeringQueue() { a.mu.Lock(); a.steeringQueue.clear(); a.mu.Unlock() }
+func (a *Agent) ClearSteeringQueue() {
+	a.mu.Lock()
+	a.steeringQueue.clear()
+	a.checkpointSteeringCounter = a.steeringCounter
+	a.mu.Unlock()
+}
 
 // ClearFollowUpQueue removes all queued follow-up messages.
 func (a *Agent) ClearFollowUpQueue() { a.mu.Lock(); a.followUpQueue.clear(); a.mu.Unlock() }
@@ -324,6 +336,7 @@ func (a *Agent) ClearFollowUpQueue() { a.mu.Lock(); a.followUpQueue.clear(); a.m
 func (a *Agent) ClearAllQueues() {
 	a.mu.Lock()
 	a.steeringQueue.clear()
+	a.checkpointSteeringCounter = a.steeringCounter
 	a.followUpQueue.clear()
 	a.mu.Unlock()
 }
@@ -388,6 +401,7 @@ func (a *Agent) Reset() error {
 	a.state.PendingToolCalls = map[string]bool{}
 	a.state.ErrorMessage = ""
 	a.steeringQueue.clear()
+	a.checkpointSteeringCounter = a.steeringCounter
 	a.followUpQueue.clear()
 	return nil
 }
@@ -409,6 +423,7 @@ func (a *Agent) PromptMessages(ctx context.Context, messages []AgentMessage) err
 		a.mu.Unlock()
 		return errors.New("Agent is already processing a prompt. Use Steer() or FollowUp() to queue messages, or wait for completion.")
 	}
+	a.checkpointSteeringCounter = a.steeringCounter
 	a.mu.Unlock()
 	return a.runPromptMessages(ctx, messages, false)
 }
@@ -440,9 +455,11 @@ func (a *Agent) Continue(ctx context.Context) error {
 			if steering := a.steeringQueue.drain(); len(steering) > 0 {
 				drained = steering
 				skipInitialSteeringPoll = true
+				a.checkpointSteeringCounter = a.steeringCounter
 				return
 			}
 			drained = a.followUpQueue.drain()
+			a.checkpointSteeringCounter = a.steeringCounter
 		})
 		if err != nil {
 			return errors.New("Agent is already processing. Wait for completion before continuing.")
@@ -465,6 +482,9 @@ func (a *Agent) runPromptMessages(parent context.Context, messages []AgentMessag
 }
 
 func (a *Agent) runContinuation(parent context.Context) error {
+	a.mu.Lock()
+	a.checkpointSteeringCounter = a.steeringCounter
+	a.mu.Unlock()
 	return a.runWithLifecycle(parent, func(ctx context.Context) {
 		runAgentLoopContinue(ctx, a.contextSnapshot(), a.loopConfig(false), a.processEvent(ctx), a.StreamFn)
 	})
@@ -572,7 +592,7 @@ func (a *Agent) loopConfig(skipInitialSteeringPoll bool) AgentLoopConfig {
 			if skip {
 				return false
 			}
-			return a.steeringQueue.hasItems()
+			return a.steeringQueue.hasItems() && a.steeringCounter > a.checkpointSteeringCounter
 		},
 		GetSteeringMessages: func() []AgentMessage {
 			a.mu.Lock()
@@ -581,7 +601,9 @@ func (a *Agent) loopConfig(skipInitialSteeringPoll bool) AgentLoopConfig {
 				skip = false
 				return nil
 			}
-			return a.steeringQueue.drain()
+			msgs := a.steeringQueue.drain()
+			a.checkpointSteeringCounter = a.steeringCounter
+			return msgs
 		},
 		GetFollowUpMessages: func() []AgentMessage {
 			a.mu.Lock()
