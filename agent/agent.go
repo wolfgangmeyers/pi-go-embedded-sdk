@@ -5,6 +5,7 @@ import (
 	"errors"
 	"slices"
 	"sync"
+	"sync/atomic"
 
 	"github.com/sky-valley/pi/ai"
 )
@@ -130,10 +131,9 @@ type Agent struct {
 	state            AgentState
 	listeners        []Listener
 
-	steeringQueue             pendingQueue
-	steeringCounter           uint64
-	checkpointSteeringCounter uint64
-	followUpQueue             pendingQueue
+	steeringQueue   pendingQueue
+	followUpQueue   pendingQueue
+	hasPendingSteer atomic.Bool
 
 	ConvertToLlm     func(messages []AgentMessage) []ai.Message
 	TransformContext func(ctx context.Context, messages []AgentMessage) []AgentMessage
@@ -246,7 +246,7 @@ func NewAgent(opts AgentOptions) *Agent {
 	if a.ToolExecution == "" {
 		a.ToolExecution = ToolParallel
 	}
-	a.steeringQueue.mode = orMode(opts.SteeringMode, QueueOneAtATime)
+	a.steeringQueue.mode = orMode(opts.SteeringMode, QueueAll)
 	a.followUpQueue.mode = orMode(opts.FollowUpMode, QueueOneAtATime)
 	return a
 }
@@ -314,7 +314,7 @@ func (a *Agent) SetMessages(messages []AgentMessage) {
 func (a *Agent) Steer(m AgentMessage) {
 	a.mu.Lock()
 	a.steeringQueue.enqueue(m)
-	a.steeringCounter++
+	a.hasPendingSteer.Store(true)
 	a.mu.Unlock()
 }
 
@@ -325,7 +325,7 @@ func (a *Agent) FollowUp(m AgentMessage) { a.mu.Lock(); a.followUpQueue.enqueue(
 func (a *Agent) ClearSteeringQueue() {
 	a.mu.Lock()
 	a.steeringQueue.clear()
-	a.checkpointSteeringCounter = a.steeringCounter
+	a.hasPendingSteer.Store(false)
 	a.mu.Unlock()
 }
 
@@ -336,7 +336,7 @@ func (a *Agent) ClearFollowUpQueue() { a.mu.Lock(); a.followUpQueue.clear(); a.m
 func (a *Agent) ClearAllQueues() {
 	a.mu.Lock()
 	a.steeringQueue.clear()
-	a.checkpointSteeringCounter = a.steeringCounter
+	a.hasPendingSteer.Store(false)
 	a.followUpQueue.clear()
 	a.mu.Unlock()
 }
@@ -351,9 +351,7 @@ func (a *Agent) HasQueuedMessages() bool {
 // HasSteeringMessages reports whether any steering messages are currently queued
 // to be injected after the current assistant turn.
 func (a *Agent) HasSteeringMessages() bool {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.steeringQueue.hasItems() && a.steeringCounter > a.checkpointSteeringCounter
+	return a.hasPendingSteer.Load()
 }
 
 // PeekQueuedMessages previews the messages selected for the next turn without
@@ -409,7 +407,7 @@ func (a *Agent) Reset() error {
 	a.state.PendingToolCalls = map[string]bool{}
 	a.state.ErrorMessage = ""
 	a.steeringQueue.clear()
-	a.checkpointSteeringCounter = a.steeringCounter
+	a.hasPendingSteer.Store(false)
 	a.followUpQueue.clear()
 	return nil
 }
@@ -431,7 +429,6 @@ func (a *Agent) PromptMessages(ctx context.Context, messages []AgentMessage) err
 		a.mu.Unlock()
 		return errors.New("Agent is already processing a prompt. Use Steer() or FollowUp() to queue messages, or wait for completion.")
 	}
-	a.checkpointSteeringCounter = a.steeringCounter
 	a.mu.Unlock()
 	return a.runPromptMessages(ctx, messages, false)
 }
@@ -463,11 +460,10 @@ func (a *Agent) Continue(ctx context.Context) error {
 			if steering := a.steeringQueue.drain(); len(steering) > 0 {
 				drained = steering
 				skipInitialSteeringPoll = true
-				a.checkpointSteeringCounter = a.steeringCounter
+				a.hasPendingSteer.Store(a.steeringQueue.hasItems())
 				return
 			}
 			drained = a.followUpQueue.drain()
-			a.checkpointSteeringCounter = a.steeringCounter
 		})
 		if err != nil {
 			return errors.New("Agent is already processing. Wait for completion before continuing.")
@@ -490,9 +486,6 @@ func (a *Agent) runPromptMessages(parent context.Context, messages []AgentMessag
 }
 
 func (a *Agent) runContinuation(parent context.Context) error {
-	a.mu.Lock()
-	a.checkpointSteeringCounter = a.steeringCounter
-	a.mu.Unlock()
 	return a.runWithLifecycle(parent, func(ctx context.Context) {
 		runAgentLoopContinue(ctx, a.contextSnapshot(), a.loopConfig(false), a.processEvent(ctx), a.StreamFn)
 	})
@@ -595,12 +588,7 @@ func (a *Agent) loopConfig(skipInitialSteeringPoll bool) AgentLoopConfig {
 		PrepareRequest:            a.PrepareRequest,
 		PrepareNextTurn:           a.PrepareNextTurn,
 		HasSteeringMessages: func() bool {
-			a.mu.Lock()
-			defer a.mu.Unlock()
-			if skip {
-				return false
-			}
-			return a.steeringQueue.hasItems() && a.steeringCounter > a.checkpointSteeringCounter
+			return a.hasPendingSteer.Load()
 		},
 		GetSteeringMessages: func() []AgentMessage {
 			a.mu.Lock()
@@ -610,7 +598,7 @@ func (a *Agent) loopConfig(skipInitialSteeringPoll bool) AgentLoopConfig {
 				return nil
 			}
 			msgs := a.steeringQueue.drain()
-			a.checkpointSteeringCounter = a.steeringCounter
+			a.hasPendingSteer.Store(a.steeringQueue.hasItems())
 			return msgs
 		},
 		GetFollowUpMessages: func() []AgentMessage {

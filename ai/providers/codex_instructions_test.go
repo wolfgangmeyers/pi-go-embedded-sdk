@@ -17,10 +17,12 @@ import (
 func TestCodexLeadingInstructionsOffline(t *testing.T) {
 	base := []ai.Message{ai.NewSystemText("root instructions", 1), ai.NewUserText("first user", 2)}
 	continued := append([]ai.Message{}, base...)
+	readSys := ai.NewSystemText("later update", 5)
+	readSys.ToolsAdded = []ai.Tool{{Name: "read"}}
 	continued = append(continued,
 		ai.AssistantMessage{Api: ai.APIOpenAICodexResponses, Provider: "openai-codex", Model: "gpt-6-sol", Content: ai.ContentList{ai.ToolCall{ID: "call_1|fc_1", Name: "read", Arguments: map[string]any{"path": "/x"}}}, StopReason: ai.StopToolUse, Timestamp: 3},
 		ai.ToolResultMessage{ToolCallID: "call_1|fc_1", ToolName: "read", Content: ai.ContentList{ai.TextContent{Text: "file body"}}, Timestamp: 4},
-		ai.NewSystemText("later update", 5), ai.NewUserText("second user", 6))
+		readSys, ai.NewUserText("second user", 6))
 	user := map[string]any{"role": "user", "content": []any{map[string]any{"type": "input_text", "text": "first user"}}}
 	for _, tc := range []struct {
 		name         string

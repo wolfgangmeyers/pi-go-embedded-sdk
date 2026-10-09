@@ -530,6 +530,17 @@ func failToolCallsFromTruncatedMessage(toolCalls []ai.ToolCall, emit EventSink) 
 	return executedBatch{messages: messages, terminate: false}
 }
 
+func interruptedToolOutcome(tc ai.ToolCall) finalizedOutcome {
+	return finalizedOutcome{
+		toolCall: tc,
+		result: errorToolResult(fmt.Sprintf(
+			`Tool call "%s" was not executed: interrupted by user steering message.`,
+			tc.Name,
+		)),
+		isError: true,
+	}
+}
+
 func executeToolCalls(ctx context.Context, current *AgentContext, msg *ai.AssistantMessage, config AgentLoopConfig, emit EventSink) executedBatch {
 	toolCalls := filterToolCalls(msg)
 	if config.HasSteeringMessages != nil && config.HasSteeringMessages() {
@@ -537,14 +548,7 @@ func executeToolCalls(ctx context.Context, current *AgentContext, msg *ai.Assist
 		var messages []ai.ToolResultMessage
 		for _, tc := range toolCalls {
 			mustEmit(emit, AgentEvent{Type: EvToolExecutionStart, ToolCallID: tc.ID, ToolName: tc.Name, Args: tc.Arguments})
-			fo := finalizedOutcome{
-				toolCall: tc,
-				result: errorToolResult(fmt.Sprintf(
-					`Tool call "%s" was not executed: interrupted by user steering message.`,
-					tc.Name,
-				)),
-				isError: true,
-			}
+			fo := interruptedToolOutcome(tc)
 			emitToolExecutionEnd(fo, emit)
 			trm := createToolResultMessage(fo)
 			emitToolResultMessage(trm, emit)
@@ -600,14 +604,7 @@ func executeToolCallsSequential(ctx context.Context, current *AgentContext, msg 
 		if hasSteering() {
 			for _, remaining := range toolCalls[i:] {
 				mustEmit(emit, AgentEvent{Type: EvToolExecutionStart, ToolCallID: remaining.ID, ToolName: remaining.Name, Args: remaining.Arguments})
-				fo := finalizedOutcome{
-					toolCall: remaining,
-					result: errorToolResult(fmt.Sprintf(
-						`Tool call "%s" was not executed: interrupted by user steering message.`,
-						remaining.Name,
-					)),
-					isError: true,
-				}
+				fo := interruptedToolOutcome(remaining)
 				emitToolExecutionEnd(fo, emit)
 				trm := createToolResultMessage(fo)
 				emitToolResultMessage(trm, emit)
@@ -770,14 +767,7 @@ func executeToolCallsParallel(ctx context.Context, current *AgentContext, msg *a
 			continue
 		}
 		if hasSteering() {
-			fo := finalizedOutcome{
-				toolCall: s.toolCall,
-				result: errorToolResult(fmt.Sprintf(
-					`Tool call "%s" was not executed: interrupted by user steering message.`,
-					s.toolCall.Name,
-				)),
-				isError: true,
-			}
+			fo := interruptedToolOutcome(s.toolCall)
 			func() {
 				defer func() {
 					if r := recover(); r != nil {
@@ -798,14 +788,7 @@ func executeToolCallsParallel(ctx context.Context, current *AgentContext, msg *a
 				}
 			}()
 			if hasSteering() {
-				fo := finalizedOutcome{
-					toolCall: s.toolCall,
-					result: errorToolResult(fmt.Sprintf(
-						`Tool call "%s" was not executed: interrupted by user steering message.`,
-						s.toolCall.Name,
-					)),
-					isError: true,
-				}
+				fo := interruptedToolOutcome(s.toolCall)
 				func() {
 					serialMu.Lock()
 					defer serialMu.Unlock()
