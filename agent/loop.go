@@ -740,6 +740,13 @@ func executeToolCallsParallel(ctx context.Context, current *AgentContext, msg *a
 	// finalize, so AfterToolCall never runs for it; deciding here also keeps those
 	// end events in slot order, as pi's synchronous map does.
 	batchAborted := aborted(ctx)
+	hasSteering := func() bool {
+		if config.HasSteeringMessages != nil {
+			return config.HasSteeringMessages()
+		}
+		return false
+	}
+
 	for i, s := range slots {
 		if s.immediate != nil {
 			ordered[i] = *s.immediate
@@ -762,16 +769,59 @@ func executeToolCallsParallel(ctx context.Context, current *AgentContext, msg *a
 			ordered[i] = fo
 			continue
 		}
+		if hasSteering() {
+			fo := finalizedOutcome{
+				toolCall: s.toolCall,
+				result: errorToolResult(fmt.Sprintf(
+					`Tool call "%s" was not executed: interrupted by user steering message.`,
+					s.toolCall.Name,
+				)),
+				isError: true,
+			}
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						panicOnce.Do(func() { panicVal = r })
+					}
+				}()
+				emitToolExecutionEnd(fo, safeEmit)
+			}()
+			ordered[i] = fo
+			continue
+		}
 		wg.Add(1)
-		go func(i int, thunk func() finalizedOutcome) {
+		go func(i int, s slot) {
 			defer wg.Done()
 			defer func() {
 				if r := recover(); r != nil {
 					panicOnce.Do(func() { panicVal = r })
 				}
 			}()
-			ordered[i] = thunk()
-		}(i, s.thunk)
+			if hasSteering() {
+				fo := finalizedOutcome{
+					toolCall: s.toolCall,
+					result: errorToolResult(fmt.Sprintf(
+						`Tool call "%s" was not executed: interrupted by user steering message.`,
+						s.toolCall.Name,
+					)),
+					isError: true,
+				}
+				func() {
+					serialMu.Lock()
+					defer serialMu.Unlock()
+					_ = emit(AgentEvent{
+						Type:       EvToolExecutionEnd,
+						ToolCallID: fo.toolCall.ID,
+						ToolName:   fo.toolCall.Name,
+						Result:     fo.result,
+						IsError:    fo.isError,
+					})
+				}()
+				ordered[i] = fo
+				return
+			}
+			ordered[i] = s.thunk()
+		}(i, s)
 	}
 	wg.Wait()
 	// Re-raise any listener-error/panic from a tool goroutine on the loop

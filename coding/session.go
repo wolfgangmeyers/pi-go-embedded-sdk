@@ -76,6 +76,11 @@ type SessionOptions struct {
 	// summarization on the session's own model, as before.
 	Models ai.Models
 
+	// ToolExecution controls how batches of tool calls are executed. Defaults
+	// to ToolSequential for coding sessions so tools execute in deterministic
+	// order and mid-batch steering interruptions take effect immediately.
+	ToolExecution agent.ToolExecutionMode
+
 	// Per-request provider controls (all optional).
 	Temperature     *float64
 	MaxTokens       *int
@@ -524,6 +529,11 @@ func NewSession(opts SessionOptions) *Session {
 		thinking = agent.ThinkOff
 	}
 
+	toolExecution := opts.ToolExecution
+	if toolExecution == "" {
+		toolExecution = agent.ToolSequential
+	}
+
 	// pi's sdk.ts builds the Agent with no prompt and no tools: seeding either
 	// would put an event-less system message at the head of the transcript
 	// that the session never records. The tools are set directly (the loop
@@ -536,6 +546,7 @@ func NewSession(opts SessionOptions) *Session {
 			Model:         opts.Model,
 			ThinkingLevel: thinking,
 		},
+		ToolExecution:     toolExecution,
 		StreamFn:          sessionStreamFn(opts.StreamFn),
 		SessionID:         opts.SessionID,
 		GetApiKey:         func(provider string) string { return opts.APIKey },
@@ -720,6 +731,15 @@ func (s *Session) Abort() { s.Agent.Abort() }
 
 // WaitForIdle blocks until the current run and its listeners finish.
 func (s *Session) WaitForIdle() { s.Agent.WaitForIdle() }
+
+// HasSteeringMessages reports whether any steering messages are currently queued
+// to be injected after the current assistant turn.
+func (s *Session) HasSteeringMessages() bool {
+	if s == nil || s.Agent == nil {
+		return false
+	}
+	return s.Agent.HasSteeringMessages()
+}
 
 // normalizePromptImages is pi's _normalizePromptImages (agent-session.ts,
 // upstream f5c946480): an image entering the transcript is converted to a

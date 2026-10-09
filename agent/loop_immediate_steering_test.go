@@ -309,3 +309,187 @@ func TestSteeredMessageInvokingToolDoesNotAbortItself(t *testing.T) {
 	}
 }
 
+func TestSteeringMidToolBatchWithSequentialOptionAbortsRemainingTools(t *testing.T) {
+	var toolACalled, toolBCalled, toolCCalled atomic.Bool
+	var agentRef *Agent
+
+	toolA := AgentTool{
+		Name:        "toolA",
+		Description: "Tool A",
+		Parameters:  ai.Object(),
+		// ExecutionMode left empty (default), relying on ToolExecution on Agent
+		Execute: func(ctx context.Context, id string, params map[string]any, onUpdate ToolUpdateFunc) (AgentToolResult, error) {
+			toolACalled.Store(true)
+			// Steer while toolA is running
+			agentRef.Steer(ai.NewUserText("stop now and answer my question", 0))
+			return AgentToolResult{Content: ai.ContentList{ai.TextContent{Text: "resultA"}}}, nil
+		},
+	}
+	toolB := AgentTool{
+		Name:        "toolB",
+		Description: "Tool B",
+		Parameters:  ai.Object(),
+		Execute: func(ctx context.Context, id string, params map[string]any, onUpdate ToolUpdateFunc) (AgentToolResult, error) {
+			toolBCalled.Store(true)
+			return AgentToolResult{Content: ai.ContentList{ai.TextContent{Text: "resultB"}}}, nil
+		},
+	}
+	toolC := AgentTool{
+		Name:        "toolC",
+		Description: "Tool C",
+		Parameters:  ai.Object(),
+		Execute: func(ctx context.Context, id string, params map[string]any, onUpdate ToolUpdateFunc) (AgentToolResult, error) {
+			toolCCalled.Store(true)
+			return AgentToolResult{Content: ai.ContentList{ai.TextContent{Text: "resultC"}}}, nil
+		},
+	}
+
+	turn1 := assistantWithToolList(
+		ai.ToolCall{ID: "call_a", Name: "toolA", Arguments: map[string]any{}},
+		ai.ToolCall{ID: "call_b", Name: "toolB", Arguments: map[string]any{}},
+		ai.ToolCall{ID: "call_c", Name: "toolC", Arguments: map[string]any{}},
+	)
+	turn2 := textMessage("Immediately answering: stop now and answer my question")
+
+	var requests []ai.TranscriptContext
+	scripted := scriptedStream(turn1, turn2)
+
+	streamFn := func(ctx context.Context, model *ai.Model, req ai.TranscriptContext, opts *ai.SimpleStreamOptions) *ai.AssistantMessageEventStream {
+		requests = append(requests, req)
+		return scripted(ctx, model, req, opts)
+	}
+
+	a := NewAgent(AgentOptions{
+		InitialState: &AgentState{
+			Model: testModel,
+			Tools: []AgentTool{toolA, toolB, toolC},
+		},
+		ToolExecution: ToolSequential,
+		StreamFn:      streamFn,
+	})
+	agentRef = a
+
+	if err := a.Prompt(context.Background(), "initial task"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if !toolACalled.Load() {
+		t.Fatal("expected toolA to be called")
+	}
+	if toolBCalled.Load() {
+		t.Fatal("toolB should NOT have been called because steering arrived")
+	}
+	if toolCCalled.Load() {
+		t.Fatal("toolC should NOT have been called because steering arrived")
+	}
+
+	if len(requests) != 2 {
+		t.Fatalf("expected 2 requests, got %d", len(requests))
+	}
+
+	// Verify tool results in request 2:
+	// toolA succeeded, toolB and toolC were aborted as interrupted
+	req2Messages := requests[1].Messages
+	var resA, resB, resC *ai.ToolResultMessage
+	for _, m := range req2Messages {
+		if tr, ok := m.(ai.ToolResultMessage); ok {
+			switch tr.ToolCallID {
+			case "call_a":
+				copyTR := tr
+				resA = &copyTR
+			case "call_b":
+				copyTR := tr
+				resB = &copyTR
+			case "call_c":
+				copyTR := tr
+				resC = &copyTR
+			}
+		}
+	}
+
+	if resA == nil || resA.IsError {
+		t.Fatalf("expected resA to be non-error, got: %+v", resA)
+	}
+	if resB == nil || !resB.IsError || !strings.Contains(trText(*resB), "interrupted by user steering message") {
+		t.Fatalf("expected resB to be aborted with steering message, got: %+v", resB)
+	}
+	if resC == nil || !resC.IsError || !strings.Contains(trText(*resC), "interrupted by user steering message") {
+		t.Fatalf("expected resC to be aborted with steering message, got: %+v", resC)
+	}
+
+	// Verify HasSteeringMessages method on Agent returns false after being handled
+	if a.HasSteeringMessages() {
+		t.Fatal("expected HasSteeringMessages to be false after steering was handled")
+	}
+}
+
+func TestSteeringMidToolBatchParallelExecutionAbortsRemainingTools(t *testing.T) {
+	var toolACalled, toolBCalled atomic.Bool
+	var agentRef *Agent
+	toolAStarted := make(chan struct{})
+	allowToolAFinish := make(chan struct{})
+
+	toolA := AgentTool{
+		Name:        "toolA",
+		Description: "Tool A",
+		Parameters:  ai.Object(),
+		Execute: func(ctx context.Context, id string, params map[string]any, onUpdate ToolUpdateFunc) (AgentToolResult, error) {
+			toolACalled.Store(true)
+			close(toolAStarted)
+			<-allowToolAFinish
+			return AgentToolResult{Content: ai.ContentList{ai.TextContent{Text: "resultA"}}}, nil
+		},
+	}
+	toolB := AgentTool{
+		Name:        "toolB",
+		Description: "Tool B",
+		Parameters:  ai.Object(),
+		Execute: func(ctx context.Context, id string, params map[string]any, onUpdate ToolUpdateFunc) (AgentToolResult, error) {
+			toolBCalled.Store(true)
+			return AgentToolResult{Content: ai.ContentList{ai.TextContent{Text: "resultB"}}}, nil
+		},
+	}
+
+	turn1 := assistantWithToolList(
+		ai.ToolCall{ID: "call_a", Name: "toolA", Arguments: map[string]any{}},
+		ai.ToolCall{ID: "call_b", Name: "toolB", Arguments: map[string]any{}},
+	)
+	turn2 := textMessage("Immediately answering: parallel steer")
+
+	var requests []ai.TranscriptContext
+	scripted := scriptedStream(turn1, turn2)
+
+	streamFn := func(ctx context.Context, model *ai.Model, req ai.TranscriptContext, opts *ai.SimpleStreamOptions) *ai.AssistantMessageEventStream {
+		requests = append(requests, req)
+		return scripted(ctx, model, req, opts)
+	}
+
+	a := NewAgent(AgentOptions{
+		InitialState: &AgentState{
+			Model: testModel,
+			Tools: []AgentTool{toolA, toolB},
+		},
+		ToolExecution: ToolSequential,
+		StreamFn:      streamFn,
+	})
+	agentRef = a
+
+	go func() {
+		<-toolAStarted
+		agentRef.Steer(ai.NewUserText("parallel steer", 0))
+		close(allowToolAFinish)
+	}()
+
+	if err := a.Prompt(context.Background(), "initial task"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if !toolACalled.Load() {
+		t.Fatal("expected toolA to be called")
+	}
+	if toolBCalled.Load() {
+		t.Fatal("toolB should NOT have been called because steering arrived")
+	}
+}
+
+

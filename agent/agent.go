@@ -348,6 +348,14 @@ func (a *Agent) HasQueuedMessages() bool {
 	return a.steeringQueue.hasItems() || a.followUpQueue.hasItems()
 }
 
+// HasSteeringMessages reports whether any steering messages are currently queued
+// to be injected after the current assistant turn.
+func (a *Agent) HasSteeringMessages() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.steeringQueue.hasItems() && a.steeringCounter > a.checkpointSteeringCounter
+}
+
 // PeekQueuedMessages previews the messages selected for the next turn without
 // consuming them: the next steering selection, or the next follow-up selection
 // when no steering is queued.
