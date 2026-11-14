@@ -138,12 +138,9 @@ func codexWireToolNames(payload map[string]any, original, resolved []ai.Message)
 					}
 					item["name"] = wireName
 				} else if !codexValidHistoryName.MatchString(name) {
-					// Keep invalid provider input out of the wire name grammar without
-					// accidentally selecting a declared name or reserved alias.
-					sum := sha256.Sum256([]byte(name))
-					candidate := fmt.Sprintf("unknown_%x", sum[:16])
-					for declared[candidate] || candidate == alias {
-						candidate += "_"
+					candidate, err := codexIsolatedName(name, declared, historical, alias)
+					if err != nil {
+						return nil, err
 					}
 					item["name"] = candidate
 				}
@@ -174,9 +171,24 @@ func codexWireToolNames(payload map[string]any, original, resolved []ai.Message)
 	return wire, nil
 }
 
-// An unadvertised canonical spelling must not bypass its wire alias.
-func declaredCanonicalAlias(name string, _ map[string]string) bool {
-	return name == "mecha_worker.launch"
+// Historical spelling is not execution authorization: without provenance we
+// cannot distinguish a formerly legitimate canonical call from an unknown one.
+// Preserve the established replay mapping; do not infer authorization from it.
+// Isolated names avoid all known declarations and history, with bounded work
+// and names within the provider's 64-character grammar.
+func codexIsolatedName(name string, declared, historical map[string]bool, alias string) (string, error) {
+	sum := sha256.Sum256([]byte(name))
+	base := fmt.Sprintf("unknown_%x", sum[:16])
+	for i := 0; i <= len(declared)+len(historical)+1; i++ {
+		candidate := base
+		if i > 0 {
+			candidate = fmt.Sprintf("%s_%d", base, i)
+		}
+		if len(candidate) <= 64 && !declared[candidate] && !historical[candidate] && candidate != alias {
+			return candidate, nil
+		}
+	}
+	return "", errors.New("Codex isolated tool name space exhausted")
 }
 
 // RegisterOpenAICodexResponses installs Codex's own transport. It deliberately
@@ -354,6 +366,23 @@ func streamCodexResponsesWithToolChoice(ctx context.Context, model *ai.Model, re
 			fail("Codex payload tools invalid")
 			return
 		}
+		occupied := map[string]bool{}
+		for _, messages := range [][]ai.Message{req.Messages, resolved.Messages} {
+			for _, tool := range ai.GetDeclaredTools(messages) {
+				occupied[tool.Name] = true
+			}
+		}
+		// Only wire declarations authorize dispatch. Isolate any other name that
+		// could match an executable tool; genuinely unknown names stay intact.
+		responseName := func(name string) (string, error) {
+			if canonical, ok := wireNames[name]; ok {
+				return canonical, nil
+			}
+			if occupied[name] {
+				return codexIsolatedName(name, occupied, nil, "")
+			}
+			return name, nil
+		}
 		payload, err := json.Marshal(params)
 		if err != nil {
 			fail("Codex payload encoding failed")
@@ -508,12 +537,9 @@ func streamCodexResponsesWithToolChoice(ctx context.Context, model *ai.Model, re
 					output.Content = append(output.Content, s.call)
 					slots[ev.OutputIndex] = s
 					if ev.Item.Name != "" {
-						name, ok := wireNames[ev.Item.Name]
-						if !ok {
-							if declaredCanonicalAlias(ev.Item.Name, wireNames) {
-								return errors.New("Codex unadvertised canonical tool name")
-							}
-							name = ev.Item.Name
+						name, err := responseName(ev.Item.Name)
+						if err != nil {
+							return err
 						}
 						s.call.Name = name
 						s.started = true
@@ -564,12 +590,9 @@ func streamCodexResponsesWithToolChoice(ctx context.Context, model *ai.Model, re
 						return errors.New("Codex tool item changed type")
 					}
 					if ev.Item.Name != "" {
-						name, ok := wireNames[ev.Item.Name]
-						if !ok {
-							if declaredCanonicalAlias(ev.Item.Name, wireNames) {
-								return errors.New("Codex unadvertised canonical tool name")
-							}
-							name = ev.Item.Name
+						name, err := responseName(ev.Item.Name)
+						if err != nil {
+							return err
 						}
 						if s.started && s.call.Name != name {
 							return errors.New("Codex tool name changed or undeclared")

@@ -93,3 +93,44 @@ func TestCodexAliasExhaustionHistoryLifecycle(t *testing.T) {
 		t.Fatal("unknown call not rejected")
 	}
 }
+
+func TestCodexPayloadRemovedToolCannotDispatchCanonical(t *testing.T) {
+	requests := 0
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		w.Header().Set("Content-Type", "text/event-stream")
+		if requests == 1 {
+			fmt.Fprint(w, "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc\",\"call_id\":\"call\",\"name\":\"mecha_worker.launch\"}}\n\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc\",\"call_id\":\"call\",\"name\":\"mecha_worker.launch\",\"arguments\":\"{}\"}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n")
+		} else {
+			fmt.Fprint(w, "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n")
+		}
+	}))
+	defer server.Close()
+	model := *ai.GetModel("openai-codex", "gpt-6-sol")
+	model.BaseURL = server.URL
+	executed := 0
+	a := NewAgent(AgentOptions{InitialState: &AgentState{Model: &model, Tools: []AgentTool{{Name: "mecha_worker.launch", Parameters: ai.Object(), Execute: func(context.Context, string, map[string]any, ToolUpdateFunc) (AgentToolResult, error) {
+		executed++
+		return AgentToolResult{}, nil
+	}}}}, HTTPClient: server.Client(), CodexAuth: func(context.Context) (ai.ModelAuth, error) {
+		return ai.ModelAuth{APIKey: "fixture", Headers: ai.ProviderHeaders{"ChatGPT-Account-ID": ai.HeaderValue("fixture")}}, nil
+	}, OnPayload: func(payload any, _ *ai.Model) (any, error) {
+		delete(payload.(map[string]any), "tools")
+		return nil, nil
+	}})
+	if err := a.Prompt(context.Background(), "test"); err != nil {
+		t.Fatal(err)
+	}
+	if executed != 0 || requests != 2 {
+		t.Fatalf("executed=%d requests=%d", executed, requests)
+	}
+	found := false
+	for _, m := range a.State().Messages {
+		if r, ok := m.(ai.ToolResultMessage); ok && r.ToolCallID == "call|fc" && r.IsError && r.ToolName != "mecha_worker.launch" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("missing correlated unknown tool result")
+	}
+}

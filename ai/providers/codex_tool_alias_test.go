@@ -2,6 +2,7 @@ package providers
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -306,6 +307,65 @@ data: {"type":"response.completed","response":{"status":"completed"}}
 	}
 }
 
+func TestCodexUndeclaredCanonicalStreamAndReplay(t *testing.T) {
+	opts := codexFixtureOptions()
+	count := 0
+	opts.HTTPClient = ai.HTTPDoer(codexFakeDoer(func(r *http.Request) (*http.Response, error) {
+		count++
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if count == 2 {
+			tools := body["tools"].([]any)
+			alias := tools[0].(map[string]any)["name"].(string)
+			if alias != "mecha_worker_launch" {
+				t.Errorf("unexpected alias: %s", alias)
+			}
+			input := body["input"].([]any)
+			found := false
+			for _, v := range input {
+				item, ok := v.(map[string]any)
+				if ok && item["type"] == "function_call" && item["name"] == alias {
+					found = true
+				}
+			}
+			if !found {
+				t.Errorf("unknown history missing: %#v", input)
+			}
+		}
+		name := "mecha_worker.launch"
+		if count == 2 {
+			name = "mecha_worker_launch"
+		}
+		events := fmt.Sprintf(`data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":%q}}
+
+data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":%q,"arguments":"{}"}}
+
+data: {"type":"response.completed","response":{"status":"completed"}}
+
+`, name, name)
+		return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(events))}, nil
+	}))
+	model := codexFixtureModel("https://fixture.invalid")
+	req := ai.Context{Messages: []ai.Message{ai.NewUserText("test", 1)}, Tools: []ai.Tool{{Name: "read", Parameters: &ai.Schema{Type: "object"}}}}
+	stream := ai.StreamSimple(context.Background(), model, req, opts)
+	for range stream.Events() {
+	}
+	result := stream.Result()
+	if result.StopReason != ai.StopToolUse || len(result.Content) != 1 || result.Content[0].(ai.ToolCall).Name != "mecha_worker.launch" {
+		t.Fatalf("stream: %#v", result)
+	}
+	req.Messages = append(req.Messages, *result, ai.ToolResultMessage{ToolCallID: "call_1|fc_1", ToolName: "mecha_worker.launch", Content: ai.ContentList{ai.TextContent{Text: "unavailable"}}, IsError: true})
+	req.Tools = []ai.Tool{{Name: "mecha_worker.launch", Parameters: &ai.Schema{Type: "object"}}}
+	stream = ai.StreamSimple(context.Background(), model, req, opts)
+	for range stream.Events() {
+	}
+	if got := stream.Result(); got.StopReason != ai.StopToolUse || count != 2 {
+		t.Fatalf("replay: %#v calls=%d", got, count)
+	}
+}
+
 func TestCodexHistoricalUnknownAliasDoesNotBecomeAuthorized(t *testing.T) {
 	system := ai.NewSystemText("test", 1)
 	system.ToolsAdded = []ai.Tool{{Name: "mecha_worker.launch"}}
@@ -319,17 +379,42 @@ func TestCodexHistoricalUnknownAliasDoesNotBecomeAuthorized(t *testing.T) {
 	}
 }
 
-func TestCodexUnadvertisedCanonicalAliasRejected(t *testing.T) {
-	opts := codexFixtureOptions()
-	opts.HTTPClient = ai.HTTPDoer(codexFakeDoer(func(*http.Request) (*http.Response, error) {
-		return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc\",\"call_id\":\"call\",\"name\":\"mecha_worker.launch\"}}\n\n"))}, nil
-	}))
-	req := ai.Context{Messages: []ai.Message{ai.NewUserText("test", 1)}, Tools: []ai.Tool{{Name: "mecha_worker.launch", Parameters: &ai.Schema{Type: "object"}}}}
-	stream := ai.StreamSimple(context.Background(), codexFixtureModel("https://fixture.invalid"), req, opts)
-	for range stream.Events() {
-	}
-	if got := stream.Result(); got.StopReason != ai.StopError || len(got.Content) != 0 {
-		t.Fatalf("unauthorized canonical name admitted: %#v", got)
+func TestCodexUnadvertisedCanonicalAliasIsolated(t *testing.T) {
+	for _, remove := range []bool{false, true} {
+		t.Run(fmt.Sprint(remove), func(t *testing.T) {
+			opts := codexFixtureOptions()
+			if remove {
+				opts.OnPayload = func(payload any, _ *ai.Model) (any, error) {
+					delete(payload.(map[string]any), "tools")
+					return nil, nil
+				}
+			}
+			opts.HTTPClient = ai.HTTPDoer(codexFakeDoer(func(*http.Request) (*http.Response, error) {
+				events := `data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc","call_id":"call","name":"mecha_worker.launch"}}
+
+data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc","call_id":"call","name":"mecha_worker.launch","arguments":"{}"}}
+
+data: {"type":"response.completed","response":{"status":"completed"}}
+
+`
+				return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(events))}, nil
+			}))
+			req := ai.Context{Messages: []ai.Message{ai.NewUserText("test", 1)}, Tools: []ai.Tool{{Name: "mecha_worker.launch", Parameters: &ai.Schema{Type: "object"}}}}
+			stream := ai.StreamSimple(context.Background(), codexFixtureModel("https://fixture.invalid"), req, opts)
+			for event := range stream.Events() {
+				if event.ToolCall != nil && event.ToolCall.Name == "mecha_worker.launch" {
+					t.Fatal("canonical event escaped")
+				}
+			}
+			got := stream.Result()
+			if got.StopReason != ai.StopToolUse || len(got.Content) != 1 {
+				t.Fatalf("result: %#v", got)
+			}
+			call := got.Content[0].(ai.ToolCall)
+			if call.ID != "call|fc" || !strings.HasPrefix(call.Name, "unknown_") || call.Name == req.Tools[0].Name {
+				t.Fatalf("unsafe call: %#v", call)
+			}
+		})
 	}
 }
 
@@ -351,5 +436,47 @@ func TestCodexAliasManyHistoricalCollisions(t *testing.T) {
 	}
 	if wire["mecha_worker_launch_1000"] != "mecha_worker.launch" {
 		t.Fatalf("wire: %v", wire)
+	}
+}
+
+// Replay cannot establish whether the historical canonical call was authorized.
+// Preserve established mapping when declared, without claiming provenance.
+func TestCodexCanonicalHistoryDeclarationTransitions(t *testing.T) {
+	for _, declared := range []bool{false, true} {
+		t.Run(fmt.Sprint(declared), func(t *testing.T) {
+			system := ai.NewSystemText("test", 1)
+			if declared {
+				system.ToolsAdded = []ai.Tool{{Name: "mecha_worker.launch"}}
+			}
+			input := []any{map[string]any{"type": "function_call", "name": "mecha_worker.launch"}}
+			payload := map[string]any{"input": input}
+			if declared {
+				payload["tools"] = []map[string]any{{"name": "mecha_worker.launch"}}
+			}
+			names, err := codexWireToolNames(payload, []ai.Message{system}, []ai.Message{system})
+			if err != nil {
+				t.Fatal(err)
+			}
+			replay := input[0].(map[string]any)["name"].(string)
+			if declared && names[replay] != "mecha_worker.launch" {
+				t.Fatalf("lost replay mapping: %q %v", replay, names)
+			}
+			if !declared && (!strings.HasPrefix(replay, "unknown_") || names[replay] != "") {
+				t.Fatalf("unknown replay: %q %v", replay, names)
+			}
+		})
+	}
+}
+
+func TestCodexIsolatedNameBoundedCollisions(t *testing.T) {
+	sum := sha256.Sum256([]byte("bad.name"))
+	base := fmt.Sprintf("unknown_%x", sum[:16])
+	occupied := map[string]bool{base: true}
+	for i := 1; i <= 1000; i++ {
+		occupied[fmt.Sprintf("%s_%d", base, i)] = true
+	}
+	name, err := codexIsolatedName("bad.name", occupied, nil, "")
+	if err != nil || occupied[name] || len(name) > 64 || !codexValidHistoryName.MatchString(name) {
+		t.Fatalf("name=%q err=%v", name, err)
 	}
 }
