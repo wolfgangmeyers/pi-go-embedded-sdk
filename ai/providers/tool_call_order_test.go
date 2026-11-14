@@ -166,9 +166,8 @@ func TestOrderedArgumentsIgnoredWhenArgumentsReplaced(t *testing.T) {
 	}
 }
 
-// The validation failure text is handed back to the model as a tool result, and
-// pi builds it with JSON.stringify(toolCall.arguments) — insertion order.
-func TestValidationErrorEchoesArgumentsInModelOrder(t *testing.T) {
+// Validation errors must not return argument values to the model.
+func TestValidationErrorDoesNotEchoArguments(t *testing.T) {
 	msg, err := ai.UnmarshalMessage([]byte(orderedToolCallMessage))
 	if err != nil {
 		t.Fatalf("UnmarshalMessage: %v", err)
@@ -180,7 +179,7 @@ func TestValidationErrorEchoesArgumentsInModelOrder(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected validation to fail on the missing required property")
 	}
-	if !strings.Contains(err.Error(), "\"path\": \"/tmp\",\n  \"depth\": 1,") {
-		t.Fatalf("validation error echoed arguments out of model order:\n%s", err)
+	if strings.Contains(err.Error(), "/tmp") {
+		t.Fatalf("validation error exposed argument value:\n%s", err)
 	}
 }

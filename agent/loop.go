@@ -843,7 +843,7 @@ type prepareResult struct {
 func prepareToolCall(ctx context.Context, current *AgentContext, msg *ai.AssistantMessage, tc ai.ToolCall, config AgentLoopConfig) (res prepareResult) {
 	tool, ok := findTool(current.Tools, tc.Name)
 	if !ok {
-		return prepareResult{immediate: &immediateOutcome{result: errorToolResult("Tool " + tc.Name + " not found"), isError: true}}
+		return prepareResult{immediate: &immediateOutcome{result: errorToolResult("Tool unavailable"), isError: true}}
 	}
 
 	// pi wraps prepareArguments/validate/beforeToolCall in try/catch; a throw

@@ -1,14 +1,11 @@
 package ai
 
 import (
-	"encoding/json"
 	"fmt"
-	"strings"
 )
 
 // ValidateToolArguments validates (and coerces) tool-call arguments against the
-// tool's schema, returning the validated arguments or an error formatted like
-// pi's validateToolArguments.
+// tool's schema, returning validated arguments or a value-free error.
 func ValidateToolArguments(tool Tool, toolCall ToolCall) (map[string]any, error) {
 	if tool.Parameters == nil {
 		return toolCall.Arguments, nil
@@ -25,16 +22,10 @@ func ValidateToolArguments(tool Tool, toolCall ToolCall) (map[string]any, error)
 		args = obj
 	}
 
-	if errs := tool.Parameters.validate(args, ""); len(errs) > 0 {
-		var lines []string
-		for _, e := range errs {
-			lines = append(lines, fmt.Sprintf("  - %s: %s", e.Path, e.Message))
-		}
-		// pi stringifies the arguments object, so the model sees the keys back
-		// in the order it wrote them.
-		received, _ := json.MarshalIndent(toolCall.OrderedArguments(), "", "  ")
-		return nil, fmt.Errorf("Validation failed for tool %q:\n%s\n\nReceived arguments:\n%s",
-			toolCall.Name, strings.Join(lines, "\n"), string(received))
+	if !tool.Parameters.Check(args) {
+		// Names, paths, schema text and argument values can all originate from
+		// untrusted registrations or calls. Do not reflect any of them here.
+		return nil, fmt.Errorf("Tool arguments failed schema validation")
 	}
 	return args, nil
 }
@@ -88,5 +79,5 @@ func ValidateToolCall(tools []Tool, toolCall ToolCall) (map[string]any, error) {
 			return ValidateToolArguments(t, toolCall)
 		}
 	}
-	return nil, fmt.Errorf("Tool %q not found", toolCall.Name)
+	return nil, fmt.Errorf("Tool unavailable")
 }
