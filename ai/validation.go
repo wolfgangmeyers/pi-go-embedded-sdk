@@ -58,7 +58,7 @@ func schemaRejection(s *Schema, args map[string]any) *ToolRejection {
 			continue
 		}
 		types := prop.schemaTypes()
-		if len(types) != 1 {
+		if len(types) == 0 || len(types) > 2 {
 			continue
 		}
 		switch types[0] {
@@ -66,8 +66,19 @@ func schemaRejection(s *Schema, args map[string]any) *ToolRejection {
 		default:
 			continue
 		}
-		if !matchesJSONType(v, types[0]) {
-			return &ToolRejection{Kind: "invalid_type", Field: name, Expected: types[0]}
+		matched := false
+		for _, typ := range types {
+			if matchesJSONType(v, typ) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			expected := types[0]
+			if len(types) == 2 && types[1] == "null" && types[0] != "null" {
+				expected += " or null"
+			}
+			return &ToolRejection{Kind: "invalid_type", Field: name, Expected: expected}
 		}
 	}
 	return &ToolRejection{Kind: "invalid_arguments"}

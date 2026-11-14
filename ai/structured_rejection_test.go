@@ -53,3 +53,37 @@ func TestStructuredRejectionFallbackDoesNotLeak(t *testing.T) {
 		t.Fatalf("unsafe fallback: %v", err)
 	}
 }
+
+func TestStructuredRejectionNullableFields(t *testing.T) {
+	nullableString := &Schema{Type: "string", Nullable: true}
+	nullableInteger := &Schema{Type: "integer", Nullable: true}
+	tool := Tool{Parameters: Object(Prop("path", nullableString), Prop("limit", nullableInteger))}
+	for _, tc := range []struct {
+		name            string
+		args            map[string]any
+		field, expected string
+	}{
+		{"null path and invalid nullable limit", map[string]any{"path": nil, "limit": map[string]any{}}, "limit", "integer or null"},
+		{"null limit and invalid nullable path", map[string]any{"path": []any{}, "limit": nil}, "path", "string or null"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ValidateToolArguments(tool, ToolCall{Arguments: tc.args})
+			var r *ToolRejection
+			if !errors.As(err, &r) || r.Kind != "invalid_type" || r.Field != tc.field || r.Expected != tc.expected {
+				t.Fatalf("unexpected rejection: %+v (%v)", r, err)
+			}
+		})
+	}
+}
+
+func TestStructuredRejectionSkipsValidNullableBeforeInvalidField(t *testing.T) {
+	tool := Tool{Parameters: Object(Prop("limit", &Schema{Type: "integer", Nullable: true}), Prop("path", String()))}
+	_, err := ValidateToolArguments(tool, ToolCall{Arguments: map[string]any{"limit": nil, "path": []any{}}})
+	var r *ToolRejection
+	if !errors.As(err, &r) || r.Kind != "invalid_type" || r.Field != "path" || r.Expected != "string" {
+		t.Fatalf("unexpected rejection: %+v (%v)", r, err)
+	}
+	if _, err := ValidateToolArguments(tool, ToolCall{Arguments: map[string]any{"limit": nil, "path": "ok"}}); err != nil {
+		t.Fatalf("valid nullable argument rejected: %v", err)
+	}
+}
