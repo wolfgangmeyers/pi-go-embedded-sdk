@@ -3,16 +3,20 @@ package providers
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/sky-valley/pi/ai"
 )
+
+var codexValidHistoryName = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,64}$`)
 
 var errCodexStreamUnauthorized = errors.New("Codex response failed: 401 unauthorized after stream start; turn outcome unknown")
 
@@ -26,6 +30,17 @@ func codexWireToolNames(payload map[string]any, original, resolved []ai.Message)
 			declared[tool.Name] = true
 		}
 	}
+	// Historical names are untrusted and must never become an active alias.
+	historical := map[string]bool{}
+	if input, ok := payload["input"].([]any); ok {
+		for _, entry := range input {
+			if item, ok := entry.(map[string]any); ok && (item["type"] == "function_call" || item["type"] == "custom_tool_call") {
+				if n, ok := item["name"].(string); ok && !declared[n] {
+					historical[n] = true
+				}
+			}
+		}
+	}
 	alias := ""
 	if declared["mecha_worker.launch"] {
 		for i := 0; i < 32; i++ {
@@ -33,7 +48,7 @@ func codexWireToolNames(payload map[string]any, original, resolved []ai.Message)
 			if i != 0 {
 				candidate = fmt.Sprintf("mecha_worker_launch_%d", i)
 			}
-			if !declared[candidate] {
+			if !declared[candidate] && !historical[candidate] {
 				alias = candidate
 				break
 			}
@@ -115,11 +130,22 @@ func codexWireToolNames(payload map[string]any, original, resolved []ai.Message)
 				if !ok {
 					return nil, errors.New("Codex malformed historical tool call")
 				}
-				wireName, err := rewrite(name, false)
-				if err != nil {
-					return nil, err
+				if declared[name] {
+					wireName, err := rewrite(name, false)
+					if err != nil {
+						return nil, err
+					}
+					item["name"] = wireName
+				} else if !codexValidHistoryName.MatchString(name) {
+					// Keep invalid provider input out of the wire name grammar without
+					// accidentally selecting a declared name or reserved alias.
+					sum := sha256.Sum256([]byte(name))
+					candidate := fmt.Sprintf("unknown_%x", sum[:16])
+					for declared[candidate] || candidate == alias {
+						candidate += "_"
+					}
+					item["name"] = candidate
 				}
-				item["name"] = wireName
 			}
 		}
 	}
@@ -145,6 +171,11 @@ func codexWireToolNames(payload map[string]any, original, resolved []ai.Message)
 		}
 	}
 	return wire, nil
+}
+
+// An unadvertised canonical spelling must not bypass its wire alias.
+func declaredCanonicalAlias(name string, _ map[string]string) bool {
+	return name == "mecha_worker.launch"
 }
 
 // RegisterOpenAICodexResponses installs Codex's own transport. It deliberately
@@ -478,7 +509,10 @@ func streamCodexResponsesWithToolChoice(ctx context.Context, model *ai.Model, re
 					if ev.Item.Name != "" {
 						name, ok := wireNames[ev.Item.Name]
 						if !ok {
-							return errors.New("Codex undeclared tool call")
+							if declaredCanonicalAlias(ev.Item.Name, wireNames) {
+								return errors.New("Codex unadvertised canonical tool name")
+							}
+							name = ev.Item.Name
 						}
 						s.call.Name = name
 						s.started = true
@@ -530,7 +564,13 @@ func streamCodexResponsesWithToolChoice(ctx context.Context, model *ai.Model, re
 					}
 					if ev.Item.Name != "" {
 						name, ok := wireNames[ev.Item.Name]
-						if !ok || (s.started && s.call.Name != name) {
+						if !ok {
+							if declaredCanonicalAlias(ev.Item.Name, wireNames) {
+								return errors.New("Codex unadvertised canonical tool name")
+							}
+							name = ev.Item.Name
+						}
+						if s.started && s.call.Name != name {
 							return errors.New("Codex tool name changed or undeclared")
 						}
 						s.call.Name = name

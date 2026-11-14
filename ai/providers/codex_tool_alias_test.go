@@ -86,23 +86,23 @@ func TestCodexWireAliasSSEPendingEarlierParallelPartial(t *testing.T) {
 			for _, event := range seen {
 				if event.Partial != nil {
 					for _, content := range event.Partial.Content {
-						if call, ok := content.(ai.ToolCall); ok && call.Name != "mecha_worker.launch" {
+						if call, ok := content.(ai.ToolCall); ok && (call.Name != "mecha_worker.launch" && !(tc.name == "undeclared" && call.Name == "undeclared_tool")) {
 							t.Fatalf("unnamed/aliased partial on %s: %#v", event.Type, event.Partial)
 						}
 					}
 				}
 				if event.Type == ai.EventToolCallStart || event.Type == ai.EventToolCallDelta || event.Type == ai.EventToolCallEnd {
 					call := event.Partial.Content[event.ContentIndex].(ai.ToolCall)
-					if call.Name != "mecha_worker.launch" {
+					if call.Name != "mecha_worker.launch" && !(tc.name == "undeclared" && call.Name == "undeclared_tool") {
 						t.Fatalf("noncanonical tool event: %#v", event)
 					}
-					if event.Type == ai.EventToolCallEnd && (event.ToolCall == nil || event.ToolCall.Name != "mecha_worker.launch" || event.ToolCall.ID != call.ID) {
+					if event.Type == ai.EventToolCallEnd && (event.ToolCall == nil || event.ToolCall.Name != call.Name || event.ToolCall.ID != call.ID) {
 						t.Fatalf("invalid end: %#v", event)
 					}
 					sequence = append(sequence, fmt.Sprintf("%s:%s", event.Type, call.ID))
 				}
 			}
-			if tc.name != "resolved" {
+			if tc.name == "never_resolved" {
 				if final.StopReason != ai.StopError || len(final.Content) != 0 || seen[len(seen)-1].Type != ai.EventError || len(seen[len(seen)-1].Error.Content) != 0 {
 					t.Fatalf("unresolved call escaped: %#v %#v", final, seen)
 				}
@@ -217,13 +217,8 @@ func TestCodexWireAliasSSECanonicalSplitLateParallelUnknown(t *testing.T) {
 				t.Fatalf("replayed %d", calls)
 			}
 			if tc.unknown {
-				if final.StopReason != ai.StopError || seen[len(seen)-1].Type != ai.EventError {
-					t.Fatalf("unknown name accepted: %#v", final)
-				}
-				for _, event := range seen {
-					if event.Type == ai.EventToolCallEnd || event.Type == ai.EventDone {
-						t.Fatalf("unknown name emitted terminal call: %v", event.Type)
-					}
+				if final.StopReason != ai.StopToolUse || len(final.Content) != 2 || final.Content[1].(ai.ToolCall).Name != "undeclared_tool" {
+					t.Fatalf("unknown not dispatched: %#v", final)
 				}
 				return
 			}
@@ -259,5 +254,81 @@ func TestCodexWireAliasSSECanonicalSplitLateParallelUnknown(t *testing.T) {
 				t.Fatalf("event counts: %d %d %d", starts, deltas, ends)
 			}
 		})
+	}
+}
+
+func TestCodexUnknownToolStreamAndReplay(t *testing.T) {
+	opts := codexFixtureOptions()
+	count := 0
+	opts.HTTPClient = ai.HTTPDoer(codexFakeDoer(func(r *http.Request) (*http.Response, error) {
+		count++
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if count == 2 {
+			input := body["input"].([]any)
+			found := false
+			for _, v := range input {
+				item, ok := v.(map[string]any)
+				if ok && item["type"] == "function_call" && item["name"] == "unknown_tool" {
+					found = true
+				}
+			}
+			if !found {
+				t.Errorf("unknown history missing: %#v", input)
+			}
+		}
+		events := `data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"unknown_tool"}}
+
+data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"unknown_tool","arguments":"{}"}}
+
+data: {"type":"response.completed","response":{"status":"completed"}}
+
+`
+		return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(events))}, nil
+	}))
+	model := codexFixtureModel("https://fixture.invalid")
+	req := ai.Context{Messages: []ai.Message{ai.NewUserText("test", 1)}, Tools: []ai.Tool{{Name: "read", Parameters: &ai.Schema{Type: "object"}}}}
+	stream := ai.StreamSimple(context.Background(), model, req, opts)
+	for range stream.Events() {
+	}
+	result := stream.Result()
+	if result.StopReason != ai.StopToolUse || len(result.Content) != 1 || result.Content[0].(ai.ToolCall).Name != "unknown_tool" {
+		t.Fatalf("stream: %#v", result)
+	}
+	req.Messages = append(req.Messages, *result, ai.ToolResultMessage{ToolCallID: "call_1|fc_1", ToolName: "unknown_tool", Content: ai.ContentList{ai.TextContent{Text: "unavailable"}}, IsError: true})
+	stream = ai.StreamSimple(context.Background(), model, req, opts)
+	for range stream.Events() {
+	}
+	if got := stream.Result(); got.StopReason != ai.StopToolUse || count != 2 {
+		t.Fatalf("replay: %#v calls=%d", got, count)
+	}
+}
+
+func TestCodexHistoricalUnknownAliasDoesNotBecomeAuthorized(t *testing.T) {
+	system := ai.NewSystemText("test", 1)
+	system.ToolsAdded = []ai.Tool{{Name: "mecha_worker.launch"}}
+	payload := map[string]any{"tools": []map[string]any{{"name": "mecha_worker.launch"}}, "input": []any{map[string]any{"type": "function_call", "name": "mecha_worker_launch"}}}
+	names, err := codexWireToolNames(payload, []ai.Message{system}, []ai.Message{system})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if names["mecha_worker_launch"] != "" {
+		t.Fatalf("historical unknown collides with alias: %v", names)
+	}
+}
+
+func TestCodexUnadvertisedCanonicalAliasRejected(t *testing.T) {
+	opts := codexFixtureOptions()
+	opts.HTTPClient = ai.HTTPDoer(codexFakeDoer(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc\",\"call_id\":\"call\",\"name\":\"mecha_worker.launch\"}}\n\n"))}, nil
+	}))
+	req := ai.Context{Messages: []ai.Message{ai.NewUserText("test", 1)}, Tools: []ai.Tool{{Name: "mecha_worker.launch", Parameters: &ai.Schema{Type: "object"}}}}
+	stream := ai.StreamSimple(context.Background(), codexFixtureModel("https://fixture.invalid"), req, opts)
+	for range stream.Events() {
+	}
+	if got := stream.Result(); got.StopReason != ai.StopError || len(got.Content) != 0 {
+		t.Fatalf("unauthorized canonical name admitted: %#v", got)
 	}
 }
