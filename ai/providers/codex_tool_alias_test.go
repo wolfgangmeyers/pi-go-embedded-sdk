@@ -332,3 +332,24 @@ func TestCodexUnadvertisedCanonicalAliasRejected(t *testing.T) {
 		t.Fatalf("unauthorized canonical name admitted: %#v", got)
 	}
 }
+
+func TestCodexAliasManyHistoricalCollisions(t *testing.T) {
+	system := ai.NewSystemText("test", 1)
+	system.ToolsAdded = []ai.Tool{{Name: "mecha_worker.launch"}}
+	input := make([]any, 0, 1000)
+	for i := 0; i < 1000; i++ {
+		name := "mecha_worker_launch"
+		if i > 0 {
+			name = fmt.Sprintf("mecha_worker_launch_%d", i)
+		}
+		input = append(input, map[string]any{"type": "function_call", "name": name})
+	}
+	payload := map[string]any{"tools": []map[string]any{{"name": "mecha_worker.launch"}}, "input": input}
+	wire, err := codexWireToolNames(payload, []ai.Message{system}, []ai.Message{system})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wire["mecha_worker_launch_1000"] != "mecha_worker.launch" {
+		t.Fatalf("wire: %v", wire)
+	}
+}

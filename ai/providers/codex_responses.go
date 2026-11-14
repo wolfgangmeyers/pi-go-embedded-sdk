@@ -43,7 +43,8 @@ func codexWireToolNames(payload map[string]any, original, resolved []ai.Message)
 	}
 	alias := ""
 	if declared["mecha_worker.launch"] {
-		for i := 0; i < 32; i++ {
+		// At most one candidate per occupied name can collide. The next is free.
+		for i := 0; i <= len(declared)+len(historical); i++ {
 			candidate := "mecha_worker_launch"
 			if i != 0 {
 				candidate = fmt.Sprintf("mecha_worker_launch_%d", i)
