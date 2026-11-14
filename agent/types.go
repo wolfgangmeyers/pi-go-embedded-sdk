@@ -82,6 +82,9 @@ type AgentTool struct {
 	// PrepareArguments is an optional shim applied to raw arguments before schema
 	// validation. Return the same map to indicate no change.
 	PrepareArguments func(raw map[string]any) map[string]any
+	// ValidationError optionally formats a schema rejection. The host owns safety of
+	// the returned text; arguments are untrusted. An empty result uses the safe default.
+	ValidationError func(args map[string]any) string
 	// PromptGuidelines are optional bullet lines the system prompt builder folds
 	// into its rules section (port of pi's tool promptGuidelines).
 	PromptGuidelines []string

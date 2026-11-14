@@ -31,3 +31,26 @@ func TestIssue45InvalidArgumentsShowSafeDetailBeforeAdmission(t *testing.T) {
 		t.Fatalf("missing field diagnostic: %s", text)
 	}
 }
+
+func TestValidationRejectionHookRunsBeforeAdmission(t *testing.T) {
+	for _, args := range []map[string]any{{}, {"command": map[string]any{"secret": "x"}}} {
+		admitted, executed := false, false
+		tool := AgentTool{Name: "bash", Parameters: ai.Object(ai.Prop("command", ai.String())), ValidationError: func(args map[string]any) string {
+			if len(args) == 0 {
+				return "bash missing command"
+			}
+			return "bash command must be string"
+		}, Execute: func(context.Context, string, map[string]any, ToolUpdateFunc) (AgentToolResult, error) {
+			executed = true
+			return AgentToolResult{}, nil
+		}}
+		got := prepareToolCall(context.Background(), &AgentContext{Tools: []AgentTool{tool}}, nil, ai.ToolCall{Name: "bash", Arguments: args}, AgentLoopConfig{BeforeToolExecute: func(context.Context, BeforeToolCallContext) error { admitted = true; return nil }})
+		if got.immediate == nil || !got.immediate.isError || admitted || executed {
+			t.Fatal("expected rejection before admission")
+		}
+		text := got.immediate.result.Content[0].(ai.TextContent).Text
+		if !strings.Contains(text, "bash") || !strings.Contains(text, "command") {
+			t.Fatalf("bad diagnostic %q", text)
+		}
+	}
+}

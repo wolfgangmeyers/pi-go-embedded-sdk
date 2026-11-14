@@ -870,7 +870,13 @@ func prepareToolCall(ctx context.Context, current *AgentContext, msg *ai.Assista
 
 	validated, err := ai.ValidateToolArguments(tool.asAITool(), prepared)
 	if err != nil {
-		return prepareResult{immediate: &immediateOutcome{result: errorToolResult(err.Error()), isError: true}}
+		message := err.Error()
+		if tool.ValidationError != nil {
+			if diagnostic := tool.ValidationError(prepared.Arguments); diagnostic != "" {
+				message = diagnostic
+			}
+		}
+		return prepareResult{immediate: &immediateOutcome{result: errorToolResult(message), isError: true}}
 	}
 
 	if config.BeforeToolCall != nil {
