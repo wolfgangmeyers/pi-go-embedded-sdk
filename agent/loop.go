@@ -659,7 +659,9 @@ func executeAdmittedCallsParallel(ctx context.Context, current *AgentContext, ms
 // share one serialized lane. They must not wait for another callback, tool
 // update, or sibling finalization that needs that lane. Tool bodies run outside
 // it. BeforeToolExecute and ReplayToolResult also run outside it and can overlap
-// sibling bodies and ordinary callbacks; they may wait for sibling progress.
+// earlier sibling bodies and ordinary callbacks. Admission and replay proceed
+// in call order; they must not depend on later sibling progress or on any
+// progress that itself depends on the current callback returning.
 // Callbacks must treat the supplied Context, assistant message, arguments and
 // their reachable data as immutable during the batch, or synchronize all
 // accesses with every other user. The pointers are shared, not snapshots. Hosts

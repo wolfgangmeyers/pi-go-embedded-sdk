@@ -83,6 +83,24 @@ type AgentOptions struct {
 	// to the stream options. See ai.StreamOptions.OnProviderStreamEvent.
 	OnProviderStreamEvent func(data any, model *ai.Model) error
 
+	// Tool callback concurrency: in a parallel batch, calls are prepared in
+	// order. BeforeToolCall, BeforeToolExecute and ReplayToolResult for a call
+	// finish before preparation advances to the next call. Do not depend on
+	// a later sibling being admitted, replayed, executed or finalized.
+	//
+	// With BeforeToolExecute set, each successfully admitted call can execute
+	// while later calls are prepared. Event listeners, BeforeToolCall and
+	// AfterToolCall share a serialized lane; they must not wait for progress
+	// requiring that lane. BeforeToolExecute and ReplayToolResult run outside
+	// it and can overlap earlier workers, but cannot generally wait for sibling
+	// progress: that sibling might not have started or might need this call to
+	// return first. Without BeforeToolExecute, preparation (including replay)
+	// completes before any tool body starts. Tool bodies may then run in parallel.
+	//
+	// Callback contexts, assistant messages, arguments and reachable data are
+	// shared, not snapshots. Treat them as immutable during a batch or
+	// synchronize every access; synchronize host state shared across callbacks
+	// and tool bodies as well.
 	BeforeToolCall    BeforeToolCallFunc
 	BeforeToolExecute func(ctx context.Context, c BeforeToolCallContext) error
 	ReplayToolResult  func(ctx context.Context, c BeforeToolCallContext) (*ai.ToolResultMessage, error)
