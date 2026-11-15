@@ -655,6 +655,21 @@ func executeAdmittedCallsParallel(ctx context.Context, current *AgentContext, ms
 	return executeAdmittedCallsParallelWithPublication(ctx, current, msg, calls, config, emit, nil)
 }
 
+// Parallel callback contract: event sinks, BeforeToolCall and AfterToolCall
+// share one serialized lane. They must not wait for another callback, tool
+// update, or sibling finalization that needs that lane. Tool bodies run outside
+// it. BeforeToolExecute and ReplayToolResult also run outside it and can overlap
+// sibling bodies and ordinary callbacks; they may wait for sibling progress.
+// Callbacks must treat the supplied Context, assistant message, arguments and
+// their reachable data as immutable during the batch, or synchronize all
+// accesses with every other user. The pointers are shared, not snapshots. Hosts
+// must likewise synchronize their own state shared across those callback lanes.
+//
+// A fatal check immediately before BeforeToolExecute reserves admission under
+// the same mutex as fatal publication. Publication before the check prevents
+// admission; publication after it cannot revoke that reservation. A reserved
+// hook and replay can complete, and successfully admitted execution is joined
+// before failure escapes. Cancellation and policy denial still apply normally.
 // The optional observer lets tests coordinate on fatal publication itself.
 func executeAdmittedCallsParallelWithPublication(ctx context.Context, current *AgentContext, msg *ai.AssistantMessage, calls []ai.ToolCall, config AgentLoopConfig, emit EventSink, onFatalPublished func()) executedBatch {
 	// Callback serialization must not cover admission or replay: either may wait

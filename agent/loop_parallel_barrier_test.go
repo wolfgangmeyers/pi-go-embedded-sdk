@@ -97,6 +97,8 @@ func TestParallelFatalDuringAdmissionJoinsAdmittedCalls(t *testing.T) {
 // finalization. Holding a batch-wide lock across either callback deadlocks.
 func TestParallelReplayCanWaitForSiblingFinalization(t *testing.T) {
 	finalized := make(chan struct{})
+	stop := make(chan struct{})
+	defer close(stop)
 	done := make(chan any, 1)
 	calls := []ai.ToolCall{{ID: "one", Name: "effect", Arguments: map[string]any{}}, {ID: "two", Name: "effect", Arguments: map[string]any{}}}
 	tool := AgentTool{Name: "effect", Parameters: &ai.Schema{Type: "object"}, Execute: func(context.Context, string, map[string]any, ToolUpdateFunc) (AgentToolResult, error) {
@@ -108,7 +110,10 @@ func TestParallelReplayCanWaitForSiblingFinalization(t *testing.T) {
 			BeforeToolExecute: func(context.Context, BeforeToolCallContext) error { return nil },
 			ReplayToolResult: func(_ context.Context, c BeforeToolCallContext) (*ai.ToolResultMessage, error) {
 				if c.ToolCall.ID == "two" {
-					<-finalized
+					select {
+					case <-finalized:
+					case <-stop:
+					}
 				}
 				return nil, nil
 			},
@@ -219,5 +224,47 @@ func TestAdmittedParallelCallbacksSerializedAndBodiesOverlap(t *testing.T) {
 	}
 	if overlap.Load() {
 		t.Fatal("callbacks overlapped")
+	}
+}
+
+// Admission can wait for the serialized update lane without holding it.
+func TestParallelAdmissionCanWaitForSiblingUpdate(t *testing.T) {
+	updated := make(chan struct{})
+	stop := make(chan struct{})
+	defer close(stop)
+	done := make(chan any, 1)
+	tool := AgentTool{Name: "effect", Parameters: &ai.Schema{Type: "object"}, Execute: func(_ context.Context, id string, _ map[string]any, update ToolUpdateFunc) (AgentToolResult, error) {
+		if id == "one" {
+			update(AgentToolResult{})
+		}
+		return AgentToolResult{}, nil
+	}}
+	calls := []ai.ToolCall{{ID: "one", Name: "effect", Arguments: map[string]any{}}, {ID: "two", Name: "effect", Arguments: map[string]any{}}}
+	go func() {
+		defer func() { done <- recover() }()
+		executeAdmittedCallsParallel(context.Background(), &AgentContext{Tools: []AgentTool{tool}}, nil, calls, AgentLoopConfig{
+			BeforeToolExecute: func(_ context.Context, c BeforeToolCallContext) error {
+				if c.ToolCall.ID == "two" {
+					select {
+					case <-updated:
+					case <-stop:
+					}
+				}
+				return nil
+			},
+		}, func(e AgentEvent) error {
+			if e.Type == EvToolExecutionUpdate {
+				close(updated)
+			}
+			return nil
+		})
+	}()
+	select {
+	case p := <-done:
+		if p != nil {
+			t.Fatalf("panic: %v", p)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("admission blocked sibling update")
 	}
 }
