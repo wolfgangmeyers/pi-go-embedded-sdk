@@ -419,9 +419,13 @@ const (
 type AgentEvent struct {
 	Type EventType
 
-	// AgentEnd: full new-message list for the run.
+	// AgentEnd: new messages represented by this completion. A terminal-only
+	// persistence-failure diagnostic is not a committed message and is omitted.
 	Messages []AgentMessage
-	// TurnEnd / Message*: the relevant message. Message lifecycle events are
+	// TurnEnd / Message*: the relevant message. On append rejection TurnEnd may
+	// carry an uncommitted terminal diagnostic; only MessageEnd confirms a
+	// transcript message. Consumers must not record TurnEnd as a message.
+	// Message lifecycle events are
 	// emitted for system, user, assistant and tool-result messages;
 	// MessageUpdate only for a streaming assistant message.
 	Message AgentMessage

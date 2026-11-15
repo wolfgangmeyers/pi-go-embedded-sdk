@@ -82,8 +82,8 @@ func TestEmbeddedIntentAdmissionFailureAbortsWithoutExecuteOrReplay(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := strings.Join(roles(t, h), ","); got != "system,user,assistant" {
-		t.Fatalf("uncommitted or replayable result: %s", got)
+	if got := strings.Join(roles(t, h), ","); got != "system,user,assistant,assistant" {
+		t.Fatalf("missing committed diagnostic or unexpected result: %s", got)
 	}
 	reopened := coding.NewSession(opts)
 	if err := reopened.RestoreOrdered(ctx, snap); err != nil {

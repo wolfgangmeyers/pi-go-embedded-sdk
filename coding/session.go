@@ -886,6 +886,8 @@ func (s *Session) RunMessages(ctx context.Context, prompts []agent.AgentMessage)
 	result := &RunResult{}
 	var failureStop ai.StopReason
 	var failureText string
+	// TurnEnd can carry an uncommitted terminal diagnostic. Use it only for
+	// status; transcript, usage and recorder entries come from MessageEnd.
 	unsub := s.Agent.Subscribe(func(ctx context.Context, e agent.AgentEvent) error {
 		if e.Type != agent.EvMessageEnd && e.Type != agent.EvTurnEnd {
 			return nil

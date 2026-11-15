@@ -503,14 +503,14 @@ var emptyUsage = ai.Usage{
 // panic from streamFn/convertToLlm/transformContext, or a listener error that
 // unwound the loop), synthesize a terminal assistant message and emit the full
 // failure sequence so the lifecycle is complete and state.errorMessage is set.
-// With ordered persistence, the uncommitted synthetic message is signaled only
-// by turn_end and agent_end, not as a normal transcript message.
+// The synthetic message is committed before publication when persistence is enabled.
+// A rejected append is not retried; its diagnostic is terminal-only.
 //
 // pi awaits each failure-event emit: a listener rejection stops the remaining
 // failure events and rejects prompt(), while the finally still finishes the
 // run. The returned error mirrors that rejection (state cleanup happens in
 // executeClaimedRun).
-func (a *Agent) handleRunFailure(ctx context.Context, msg string, aborted bool) error {
+func (a *Agent) handleRunFailure(ctx context.Context, msg string, aborted, appendRejected bool) error {
 	a.mu.Lock()
 	model := a.state.Model
 	a.mu.Unlock()
@@ -529,13 +529,25 @@ func (a *Agent) handleRunFailure(ctx context.Context, msg string, aborted bool) 
 		ErrorMessage: msg,
 		Timestamp:    nowMillis(),
 	}
-	// A rejected append must not be retried as a synthetic failure message.
+	// Never retry a rejected append. Otherwise commit the diagnostic before any
+	// message lifecycle event, so recorders cannot observe an uncommitted entry.
+	committed := !appendRejected
+	if committed && a.BeforeMessageEnd != nil {
+		if err := a.BeforeMessageEnd(ctx, failure); err != nil {
+			committed = false
+			failure.ErrorMessage = err.Error()
+		}
+	}
 	emit := a.eventSink(ctx, false)
 	events := []AgentEvent{}
-	if a.BeforeMessageEnd == nil {
+	if committed {
 		events = append(events, AgentEvent{Type: EvMessageStart, Message: failure}, AgentEvent{Type: EvMessageEnd, Message: failure})
 	}
-	events = append(events, AgentEvent{Type: EvTurnEnd, Message: failure, ToolResults: []ai.ToolResultMessage{}}, AgentEvent{Type: EvAgentEnd, Messages: []AgentMessage{failure}})
+	var messages []AgentMessage
+	if committed {
+		messages = []AgentMessage{failure}
+	}
+	events = append(events, AgentEvent{Type: EvTurnEnd, Message: failure, ToolResults: []ai.ToolResultMessage{}}, AgentEvent{Type: EvAgentEnd, Messages: messages})
 	for _, e := range events {
 		if err := emit(e); err != nil {
 			return err
@@ -696,7 +708,11 @@ func (a *Agent) executeClaimedRun(run *activeRun, executor func(ctx context.Cont
 				} else {
 					msg = panicMessage(r)
 				}
-				runErr = a.handleRunFailure(ctx, msg, ctx.Err() != nil)
+				var rejected *messageAppendRejected
+				if ep, ok := r.(emitPanic); ok {
+					errors.As(ep.err, &rejected)
+				}
+				runErr = a.handleRunFailure(ctx, msg, ctx.Err() != nil, rejected != nil)
 			}
 		}()
 		executor(ctx)
@@ -713,13 +729,18 @@ func (a *Agent) executeClaimedRun(run *activeRun, executor func(ctx context.Cont
 	return runErr
 }
 
+type messageAppendRejected struct{ err error }
+
+func (e *messageAppendRejected) Error() string { return e.err.Error() }
+func (e *messageAppendRejected) Unwrap() error { return e.err }
+
 // processEvent reduces internal state for a loop event, then notifies listeners.
 func (a *Agent) processEvent(ctx context.Context) EventSink { return a.eventSink(ctx, true) }
 func (a *Agent) eventSink(ctx context.Context, checked bool) EventSink {
 	return func(event AgentEvent) error {
 		if checked && event.Type == EvMessageEnd && a.BeforeMessageEnd != nil {
 			if err := a.BeforeMessageEnd(ctx, event.Message); err != nil {
-				return err
+				return &messageAppendRejected{err: err}
 			}
 		}
 		a.mu.Lock()
@@ -728,9 +749,7 @@ func (a *Agent) eventSink(ctx context.Context, checked bool) EventSink {
 			a.state.StreamingMessage = event.Message
 		case EvMessageEnd:
 			a.state.StreamingMessage = nil
-			if checked || a.BeforeMessageEnd == nil {
-				a.state.Messages = append(a.state.Messages, event.Message)
-			}
+			a.state.Messages = append(a.state.Messages, event.Message)
 		case EvToolExecutionStart:
 			// Copy-on-write (pi agent.ts:524-529, `new Set(...)`): State()'s
 			// shallow copy hands out an immutable snapshot, never the live map.
