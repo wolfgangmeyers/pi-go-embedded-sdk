@@ -1122,7 +1122,7 @@ const bashExitStdioGrace = 100 * time.Millisecond
 // u, and waits for the process. After exit it drains the pipe on a re-arming
 // idle grace rather than a fixed deadline so output a detached descendant writes
 // past exit is captured (port of 3fa40956). It returns the same error cmd.Wait
-// would: nil or *exec.ExitError on a non-zero/​signalled exit.
+// would on success, or an error that also reports output drain failures.
 func runBashCommand(cmd *exec.Cmd, w io.Writer) error {
 	pr, pw, err := os.Pipe()
 	if err != nil {

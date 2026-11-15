@@ -8,7 +8,7 @@ import (
 )
 
 // drainBashPipeFallback retains the original behavior on unsupported platforms
-// and when nonblocking setup fails.
+// only.
 func drainBashPipeFallback(cmd *exec.Cmd, pr *os.File, w io.Writer) error {
 	chunks := make(chan struct{}, 1)
 	readDone := make(chan struct{})

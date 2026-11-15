@@ -4,6 +4,7 @@ package coding
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -12,65 +13,103 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// drainBashPipe owns the reader until EOF or a post-exit idle interval. Check
-// for readable bytes before observing idle: callback time must not discard a
-// tail already buffered in the pipe. Callbacks run synchronously and can block
-// indefinitely; neither cancellation nor the idle interval bounds them.
+type bashDrainOps struct {
+	setNonblock func(int, bool) error
+	pipe        func([]int) error
+	read        func(int, []byte) (int, error)
+	poll        func([]unix.PollFd, int) (int, error)
+}
+
+var defaultBashDrainOps = bashDrainOps{unix.SetNonblock, unix.Pipe, unix.Read, unix.Poll}
+
+// drainBashPipe owns the reader until EOF or a post-exit idle interval.
+// Callbacks are synchronous and can block indefinitely.
 func drainBashPipe(cmd *exec.Cmd, pr *os.File, w io.Writer) error {
+	return drainBashPipeWithOps(cmd, pr, w, defaultBashDrainOps)
+}
+
+func drainBashPipeWithOps(cmd *exec.Cmd, pr *os.File, w io.Writer, ops bashDrainOps) error {
 	fd := int(pr.Fd())
-	if err := unix.SetNonblock(fd, true); err != nil {
-		return drainBashPipeFallback(cmd, pr, w)
+	failSetup := func(err error) error {
+		// Close before waiting: the child must not block on an undrained pipe.
+		_ = pr.Close()
+		return errors.Join(err, cmd.Wait())
 	}
-	exited := make(chan struct{})
-	done := make(chan struct{})
+	if err := ops.setNonblock(fd, true); err != nil {
+		return failSetup(fmt.Errorf("bash output nonblocking setup: %w", err))
+	}
+	wake := []int{-1, -1}
+	if err := ops.pipe(wake); err != nil {
+		return failSetup(fmt.Errorf("bash output wake pipe: %w", err))
+	}
+	done := make(chan error, 1)
 	go func() {
-		defer close(done)
 		defer pr.Close()
+		defer unix.Close(wake[0])
 		buf := make([]byte, 32*1024)
 		var idleSince time.Time
+		exited := false
 		for {
-			n, err := unix.Read(fd, buf)
+			n, err := ops.read(fd, buf)
 			if n > 0 {
 				_, _ = w.Write(buf[:n])
-				// The idle period starts after delivery, not while the callback runs.
 				idleSince = time.Time{}
 				continue
 			}
 			if err == nil {
+				done <- nil
 				return
-			} // EOF
+			}
 			if errors.Is(err, unix.EINTR) {
 				continue
 			}
 			if !errors.Is(err, unix.EAGAIN) && !errors.Is(err, unix.EWOULDBLOCK) {
+				done <- fmt.Errorf("bash output read: %w", err)
 				return
 			}
-			// Check idleness only after a nonblocking read found no buffered bytes.
-			timeout := 25 * time.Millisecond
-			select {
-			case <-exited:
+			timeout := -1
+			if exited {
 				if idleSince.IsZero() {
 					idleSince = time.Now()
 				}
 				remaining := bashExitStdioGrace - time.Since(idleSince)
 				if remaining <= 0 {
+					done <- nil
 					return
 				}
-				if remaining < timeout {
-					timeout = remaining
-				}
-			default:
+				timeout = int((remaining + time.Millisecond - 1) / time.Millisecond)
 			}
-			// Round up to avoid spinning in the final fractional millisecond.
-			ms := int((timeout + time.Millisecond - 1) / time.Millisecond)
-			_, pollErr := unix.Poll([]unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}, ms)
-			if pollErr != nil && !errors.Is(pollErr, unix.EINTR) {
+			fds := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
+			if !exited {
+				fds = append(fds, unix.PollFd{Fd: int32(wake[0]), Events: unix.POLLIN})
+			}
+			_, err = ops.poll(fds, timeout)
+			if err != nil {
+				if errors.Is(err, unix.EINTR) {
+					continue
+				}
+				done <- fmt.Errorf("bash output poll: %w", err)
 				return
+			}
+			if fds[0].Revents&unix.POLLERR != 0 {
+				done <- fmt.Errorf("bash output poll: pipe error")
+				return
+			}
+			if fds[0].Revents&unix.POLLNVAL != 0 {
+				done <- fmt.Errorf("bash output poll: %w", unix.EBADF)
+				return
+			}
+			if !exited && fds[1].Revents != 0 {
+				exited = true
 			}
 		}
 	}()
 	waitErr := cmd.Wait()
-	close(exited)
-	<-done
-	return waitErr
+	// Closing the write end wakes poll, including when exit races the first poll.
+	_ = unix.Close(wake[1])
+	drainErr := <-done
+	if drainErr == nil {
+		return waitErr
+	}
+	return errors.Join(waitErr, drainErr)
 }
