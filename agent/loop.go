@@ -971,6 +971,7 @@ type preparedToolCall struct {
 	toolCall ai.ToolCall
 	tool     AgentTool
 	args     map[string]any
+	admitted bool
 }
 
 type prepareResult struct {
@@ -1079,7 +1080,7 @@ func prepareToolCall(ctx context.Context, current *AgentContext, msg *ai.Assista
 			return res
 		}
 	}
-	if hooks.ReplayToolResult != nil {
+	if hooks.ReplayToolResult != nil && (hooks.BeforeToolExecute != nil || !aborted(ctx)) {
 		// Only an admitted, schema-valid call may request a saved complete result.
 		var replay *ai.ToolResultMessage
 		var err error
@@ -1106,7 +1107,7 @@ func prepareToolCall(ctx context.Context, current *AgentContext, msg *ai.Assista
 	if hooks.BeforeToolExecute != nil && aborted(ctx) {
 		panic(toolAdmissionAbort{err: ctx.Err()})
 	}
-	return prepareResult{prepared: &preparedToolCall{toolCall: tc, tool: tool, args: validated}}
+	return prepareResult{prepared: &preparedToolCall{toolCall: tc, tool: tool, args: validated, admitted: hooks.BeforeToolExecute != nil}}
 }
 
 // ToolCallHooks are the BeforeToolCall and AfterToolCall hooks of
@@ -1249,6 +1250,9 @@ func executePreparedToolCall(ctx context.Context, prepared preparedToolCall, onU
 				out = immediateOutcome{result: errorToolResult(panicMessage(r)), isError: true}
 			}
 		}()
+		if prepared.admitted && aborted(ctx) {
+			panic(toolAdmissionAbort{err: ctx.Err()})
+		}
 		result, err := prepared.tool.Execute(ctx, prepared.toolCall.ID, prepared.args, update)
 		if err != nil {
 			return immediateOutcome{result: errorToolResult(err.Error()), isError: true}

@@ -107,3 +107,76 @@ func TestCancellationAfterAdmissionWithoutReplayIsFatal(t *testing.T) {
 		})
 	}
 }
+
+func TestAdmittedBodyRechecksCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	executed := false
+	tool := AgentTool{Name: "effect", Parameters: &ai.Schema{Type: "object"}, Execute: func(context.Context, string, map[string]any, ToolUpdateFunc) (AgentToolResult, error) {
+		executed = true
+		return AgentToolResult{}, nil
+	}}
+	prep := prepareToolCall(ctx, &AgentContext{Tools: []AgentTool{tool}}, nil, ai.ToolCall{ID: "one", Name: "effect", Arguments: map[string]any{}}, ToolCallHooks{BeforeToolExecute: func(context.Context, BeforeToolCallContext) error { return nil }}, []AgentTool{tool})
+	cancel()
+	defer func() {
+		abort, ok := recover().(toolAdmissionAbort)
+		if !ok || !errors.Is(abort.err, context.Canceled) || executed {
+			t.Fatalf("abort=%v executed=%v", abort.err, executed)
+		}
+	}()
+	executePreparedToolCall(ctx, *prep.prepared, func(AgentToolResult) error { return nil })
+}
+
+// Cancel between the initial cancellation check and replay in the replay-only path.
+type cancelOnSecondErr struct {
+	context.Context
+	cancel context.CancelFunc
+	checks int
+}
+
+func (c *cancelOnSecondErr) Err() error {
+	c.checks++
+	if c.checks == 2 {
+		c.cancel()
+	}
+	return c.Context.Err()
+}
+
+func TestReplayOnlyDoesNotStartReplayAfterCancellation(t *testing.T) {
+	base, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ctx := &cancelOnSecondErr{Context: base, cancel: cancel}
+	replayed := false
+	tool := AgentTool{Name: "effect", Parameters: &ai.Schema{Type: "object"}}
+	prep := prepareToolCall(ctx, &AgentContext{Tools: []AgentTool{tool}}, nil, ai.ToolCall{ID: "one", Name: "effect", Arguments: map[string]any{}}, ToolCallHooks{ReplayToolResult: func(context.Context, BeforeToolCallContext) (*ai.ToolResultMessage, error) {
+		replayed = true
+		return nil, nil
+	}}, []AgentTool{tool})
+	if replayed || prep.prepared == nil {
+		t.Fatalf("replayed=%v prep=%+v", replayed, prep)
+	}
+}
+
+func TestCancelledOrderedPersistenceRejectsPublication(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	a := NewAgent(AgentOptions{})
+	var persisted []AgentMessage
+	a.BeforeMessageEnd = func(ctx context.Context, m AgentMessage) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		persisted = append(persisted, m)
+		return nil
+	}
+	first, second := &ai.UserMessage{}, &ai.UserMessage{}
+	sink := a.processEvent(ctx)
+	if err := sink(AgentEvent{Type: EvMessageEnd, Message: first}); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	if err := sink(AgentEvent{Type: EvMessageEnd, Message: second}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("error=%v", err)
+	}
+	if len(persisted) != 1 || persisted[0] != first || len(a.State().Messages) != 1 || a.State().Messages[0] != first {
+		t.Fatalf("persisted=%v state=%v", persisted, a.State().Messages)
+	}
+}
