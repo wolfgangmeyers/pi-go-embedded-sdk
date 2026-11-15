@@ -121,6 +121,33 @@ func (e *bashDrainError) Unwrap() error { return e.err }
 
 func drainFailure(err error) error { return &bashDrainError{err: err} }
 
+// onlyIncompleteDrainErrors rejects joined infrastructure failures, even when
+// an incomplete-output sentinel is also present.
+func onlyIncompleteDrainErrors(err error) bool {
+	if err == nil {
+		return true
+	}
+	if d, ok := err.(*bashDrainError); ok {
+		return d.err == ErrBashOutputIncomplete
+	}
+	if j, ok := err.(interface{ Unwrap() []error }); ok {
+		for _, child := range j.Unwrap() {
+			if !onlyIncompleteDrainErrors(child) {
+				return false
+			}
+		}
+		return true
+	}
+	if u, ok := err.(interface{ Unwrap() error }); ok {
+		if _, ok := err.(*exec.ExitError); ok {
+			return true
+		}
+		return onlyIncompleteDrainErrors(u.Unwrap())
+	}
+	_, ok := err.(*exec.ExitError)
+	return ok
+}
+
 // LocalBashOperations runs commands on the local machine through the shell the
 // tool config resolves, porting pi's createLocalBashOperations (bash.ts:84).
 func LocalBashOperations(config shellToolConfig) BashOperations {
@@ -160,7 +187,15 @@ func LocalBashOperations(config shellToolConfig) BashOperations {
 
 			runErr := runBashCommand(cmd, onDataWriter(options.OnData))
 
-			return classifyShellRun(ctx.Err(), runCtx.Err(), runErr, options.TimeoutSeconds)
+			code, runErr := classifyShellRun(ctx.Err(), runCtx.Err(), runErr, options.TimeoutSeconds)
+			// An incomplete drain still has a real, reaped shell status. Preserve it
+			// alongside the error, without masking other drain failures.
+			var drainErr *bashDrainError
+			if errors.As(runErr, &drainErr) && drainErr.err == ErrBashOutputIncomplete && onlyIncompleteDrainErrors(runErr) && cmd.ProcessState != nil {
+				status := exitCode(cmd.ProcessState)
+				code = &status
+			}
+			return code, runErr
 		},
 	}
 }

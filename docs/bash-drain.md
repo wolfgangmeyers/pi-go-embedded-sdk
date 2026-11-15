@@ -17,3 +17,10 @@ Processes that escape the group are not covered by group cancellation.
 
 Linux uses waitid with WNOWAIT; macOS uses kqueue NOTE_EXIT. Other platforms
 retain the original 100 ms rearming idle fallback without the hard limit.
+
+`LocalBashOperations.Exec` returns the observed exit code alongside
+`ErrBashOutputIncomplete`; the bash tool includes that code in its error. Other
+drain failures remain errors rather than shell-status results.
+
+Windows retains its existing fallback behavior; the Unix EOF/limit and
+post-exit descendant cancellation guarantees do not apply there.

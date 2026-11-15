@@ -1021,6 +1021,9 @@ func shellToolOps(cwd string, config shellToolConfig, sessionEnv sessionEnvFn, c
 				}
 				if errors.Is(execErr, ErrBashOutputIncomplete) {
 					text, _ := formatOutput("")
+					if exitCode != nil {
+						text = appendStatus(text, fmt.Sprintf("Command exited with code %d", *exitCode))
+					}
 					return agent.AgentToolResult{}, fmt.Errorf("%s: %w", text, execErr)
 				}
 				return agent.AgentToolResult{}, execErr

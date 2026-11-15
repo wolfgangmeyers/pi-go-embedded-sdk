@@ -208,3 +208,10 @@ func TestBashDrainFailureAfterExitKillsGroupBeforeReap(t *testing.T) {
 		t.Fatal("group cancellation not called")
 	}
 }
+
+func TestIncompleteDrainDoesNotHideOtherFailure(t *testing.T) {
+	joined := errors.Join(drainFailure(ErrBashOutputIncomplete), drainFailure(errors.New("read failed")))
+	if onlyIncompleteDrainErrors(joined) {
+		t.Fatal("mixed drain failures accepted")
+	}
+}

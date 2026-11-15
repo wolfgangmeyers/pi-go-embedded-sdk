@@ -6,12 +6,15 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -35,6 +38,32 @@ func signalFile(t *testing.T, path string) {
 	if err := os.WriteFile(path, nil, 0600); err != nil {
 		t.Errorf("signal %s: %v", path, err)
 	}
+}
+
+// Orphans may remain zombies when PID 1 does not reap promptly. A zombie is
+// terminated even though kill(pid, 0) still reports it as present.
+func waitForProcessTermination(t *testing.T, pid int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if errors.Is(syscall.Kill(pid, 0), syscall.ESRCH) {
+			return
+		}
+		if runtime.GOOS == "linux" {
+			data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+			if os.IsNotExist(err) {
+				return
+			}
+			if err == nil {
+				fields := strings.Fields(string(data[strings.LastIndex(string(data), ")")+1:]))
+				if len(fields) > 0 && fields[0] == "Z" {
+					return
+				}
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Errorf("descendant %d did not terminate", pid)
 }
 
 func TestBashDrainSlowCallbackPreservesBufferedTail(t *testing.T) {
@@ -73,14 +102,16 @@ func TestBashDrainSlowCallbackPreservesBufferedTail(t *testing.T) {
 
 func TestBashDrainDescendantIdleAndOutput(t *testing.T) {
 	t.Run("quiet", func(t *testing.T) {
-		release := filepath.Join(t.TempDir(), "release")
-		defer signalFile(t, release)
+		dir := t.TempDir()
+		release := filepath.Join(dir, "release")
+		exited := filepath.Join(dir, "exited")
+		defer func() { signalFile(t, release); waitForFile(t, exited) }()
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		done := make(chan error, 1)
 		var out bytes.Buffer
 		go func() {
-			done <- runBashCommand(exec.CommandContext(ctx, "sh", "-c", `(while [ ! -f "$1" ]; do sleep .01; done) & printf done`, "sh", release), &out)
+			done <- runBashCommand(exec.CommandContext(ctx, "sh", "-c", `(i=0; while [ ! -f "$1" ] && [ "$i" -lt 1000 ]; do sleep .01; i=$((i+1)); done; touch "$2") & printf done`, "sh", release, exited), &out)
 		}()
 		select {
 		case err := <-done:
@@ -155,7 +186,8 @@ func TestBashDrainContinuousDescendantIsBounded(t *testing.T) {
 func TestBashDrainCancelAfterParentExit(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "sh", "-c", `(while :; do printf x; done) & exit 0`)
+	pidFile := filepath.Join(t.TempDir(), "pid")
+	cmd := exec.CommandContext(ctx, "sh", "-c", `(while :; do printf x; done) & echo $! > "$1"; exit 0`, "sh", pidFile)
 	setProcessGroup(cmd)
 	cmd.Cancel = func() error { return killProcessTree(cmd) }
 	done := make(chan error, 1)
@@ -187,13 +219,27 @@ func TestBashDrainCancelAfterParentExit(t *testing.T) {
 		close(release)
 		t.Fatal("shell did not exit")
 	}
+	data, err := os.ReadFile(pidFile)
+	if err != nil {
+		close(release)
+		t.Fatal(err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		close(release)
+		t.Fatal(err)
+	}
 	cancel()
 	close(release)
 	select {
-	case <-done:
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected cancellation, got %v", err)
+		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("cancellation did not finish drain")
 	}
+	waitForProcessTermination(t, pid)
 }
 
 func TestBashDrainDelayedDescendantOutput(t *testing.T) {
@@ -244,7 +290,7 @@ func TestBashDrainLimitReportedByOperations(t *testing.T) {
 	defer cancel()
 	ops := LocalBashOperations(bashShellConfig)
 	code, err := ops.Exec(ctx, `(while :; do printf x; done) & exit 0`, t.TempDir(), BashExecOptions{Env: os.Environ()})
-	if code != nil || !errors.Is(err, ErrBashOutputIncomplete) {
+	if code == nil || *code != 0 || !errors.Is(err, ErrBashOutputIncomplete) {
 		t.Fatalf("code %v error %v", code, err)
 	}
 }
@@ -299,5 +345,19 @@ func TestBashDrainCancellationClassificationAfterExit(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("cancellation did not complete")
+	}
+}
+
+func TestBashIncompletePreservesNonzeroExit(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+	ops := LocalBashOperations(bashShellConfig)
+	code, err := ops.Exec(ctx, `(sleep 3) & exit 7`, t.TempDir(), BashExecOptions{Env: os.Environ()})
+	if code == nil || *code != 7 || !errors.Is(err, ErrBashOutputIncomplete) {
+		t.Fatalf("code %v, error %v", code, err)
+	}
+	_, err = bashTool(t.TempDir(), nil).Execute(ctx, "id", map[string]any{"command": `(sleep 3) & exit 7`}, nil)
+	if !errors.Is(err, ErrBashOutputIncomplete) || !strings.Contains(err.Error(), "Command exited with code 7") {
+		t.Fatalf("error %v", err)
 	}
 }
