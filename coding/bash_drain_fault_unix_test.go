@@ -185,17 +185,20 @@ func TestBashDrainFailureAfterExitKillsGroupBeforeReap(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The inherited pipe independently witnesses the descendant closing on
-	// cancellation, and the sleep bounds its lifetime on every failure path.
+	// cancellation. A controlled release and watchdog bound its lifetime.
 	ackRead, ackWrite, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer ackRead.Close()
 	defer ackWrite.Close()
-	ready := filepath.Join(t.TempDir(), "ready")
+	dir := t.TempDir()
+	ready := filepath.Join(dir, "ready")
+	release := filepath.Join(dir, "release")
+	releaseWatchdog(t, release)
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "sh", "-c", `(touch "$1"; exec sleep 4) & while [ ! -f "$1" ]; do sleep .01; done; exit 0`, "sh", ready)
+	cmd := exec.CommandContext(ctx, "sh", "-c", `(printf R >&3; touch "$1"; while [ ! -f "$2" ]; do sleep .01; done) & while [ ! -f "$1" ]; do sleep .01; done; exit 0`, "sh", ready, release)
 	cmd.ExtraFiles = []*os.File{ackWrite}
 	setProcessGroup(cmd)
 	called := make(chan struct{}, 1)
@@ -204,17 +207,57 @@ func TestBashDrainFailureAfterExitKillsGroupBeforeReap(t *testing.T) {
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
+	// Until the drain takes ownership, always cancel and reap the leader on failure.
+	owned := true
+	defer func() {
+		if owned {
+			cancel()
+			_ = cmd.Wait()
+		}
+	}()
 	pw.Close()
 	if err := ackWrite.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := observeBashExit(cmd.Process.Pid); err != nil {
-		t.Fatal(err)
+	exited := make(chan error, 1)
+	go func() { exited <- observeBashExit(cmd.Process.Pid) }()
+	select {
+	case err := <-exited:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal("leader exit observation timed out")
+	}
+	handshake := make(chan error, 1)
+	go func() {
+		b := make([]byte, 1)
+		_, err := io.ReadFull(ackRead, b)
+		if err == nil && b[0] != 'R' {
+			err = errors.New("invalid witness handshake")
+		}
+		handshake <- err
+	}()
+	select {
+	case err := <-handshake:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal("witness handshake timed out")
+	}
+	closed := make(chan error, 1)
+	go func() { _, err := io.Copy(io.Discard, ackRead); closed <- err }()
+	select {
+	case err := <-closed:
+		t.Fatalf("witness exited before cancellation: %v", err)
+	default:
 	}
 	ops := defaultBashDrainOps
 	sentinel := errors.New("after exit")
 	ops.read = func(int, []byte) (int, error) { return 0, sentinel }
 	err = drainBashPipeWithOps(cmd, pr, io.Discard, ops)
+	owned = false
 	if !errors.Is(err, sentinel) {
 		t.Fatalf("error %v", err)
 	}
@@ -223,8 +266,6 @@ func TestBashDrainFailureAfterExitKillsGroupBeforeReap(t *testing.T) {
 	default:
 		t.Fatal("group cancellation not called")
 	}
-	closed := make(chan error, 1)
-	go func() { _, err := io.Copy(io.Discard, ackRead); closed <- err }()
 	select {
 	case err := <-closed:
 		if err != nil {
