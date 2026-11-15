@@ -885,14 +885,18 @@ func (s *Session) RunMessages(ctx context.Context, prompts []agent.AgentMessage)
 
 	result := &RunResult{}
 	var failureStop ai.StopReason
+	var failureText string
 	unsub := s.Agent.Subscribe(func(ctx context.Context, e agent.AgentEvent) error {
-		if e.Type != agent.EvMessageEnd {
+		if e.Type != agent.EvMessageEnd && e.Type != agent.EvTurnEnd {
 			return nil
 		}
 		if am, ok := messageAsAssistant(e.Message); ok {
-			addUsage(&result.Usage, am.Usage)
+			if e.Type == agent.EvMessageEnd {
+				addUsage(&result.Usage, am.Usage)
+			}
 			if am.ErrorMessage != "" {
 				failureStop = am.StopReason
+				failureText = lastAssistantText([]agent.AgentMessage{am})
 			}
 		}
 		return nil
@@ -917,10 +921,11 @@ func (s *Session) RunMessages(ctx context.Context, prompts []agent.AgentMessage)
 			result.StopReason = am.StopReason
 		}
 	}
-	result.Text = s.LastAssistantText()
+	result.Text = lastAssistantText(result.Messages)
 	result.ErrorMessage = st.ErrorMessage
 	if result.ErrorMessage != "" {
 		if failureStop != "" {
+			result.Text = failureText
 			result.StopReason = failureStop
 		}
 		return result, fmt.Errorf("%s", result.ErrorMessage)

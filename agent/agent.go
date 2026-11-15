@@ -502,8 +502,9 @@ var emptyUsage = ai.Usage{
 // handleRunFailure mirrors pi agent.ts:476-492: when the executor throws (a Go
 // panic from streamFn/convertToLlm/transformContext, or a listener error that
 // unwound the loop), synthesize a terminal assistant message and emit the full
-// failure sequence (message_start → message_end → turn_end → agent_end) so the
-// lifecycle is always complete and state.errorMessage is set.
+// failure sequence so the lifecycle is complete and state.errorMessage is set.
+// With ordered persistence, the uncommitted synthetic message is signaled only
+// by turn_end and agent_end, not as a normal transcript message.
 //
 // pi awaits each failure-event emit: a listener rejection stops the remaining
 // failure events and rejects prompt(), while the finally still finishes the
@@ -530,12 +531,12 @@ func (a *Agent) handleRunFailure(ctx context.Context, msg string, aborted bool) 
 	}
 	// A rejected append must not be retried as a synthetic failure message.
 	emit := a.eventSink(ctx, false)
-	for _, e := range []AgentEvent{
-		{Type: EvMessageStart, Message: failure},
-		{Type: EvMessageEnd, Message: failure},
-		{Type: EvTurnEnd, Message: failure, ToolResults: []ai.ToolResultMessage{}},
-		{Type: EvAgentEnd, Messages: []AgentMessage{failure}},
-	} {
+	events := []AgentEvent{}
+	if a.BeforeMessageEnd == nil {
+		events = append(events, AgentEvent{Type: EvMessageStart, Message: failure}, AgentEvent{Type: EvMessageEnd, Message: failure})
+	}
+	events = append(events, AgentEvent{Type: EvTurnEnd, Message: failure, ToolResults: []ai.ToolResultMessage{}}, AgentEvent{Type: EvAgentEnd, Messages: []AgentMessage{failure}})
+	for _, e := range events {
 		if err := emit(e); err != nil {
 			return err
 		}
