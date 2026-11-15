@@ -271,6 +271,13 @@ type ImageContent struct {
 
 func (ImageContent) contentType() string { return "image" }
 
+// CodexReplayProvenance records whether the wire name was advertised on the
+// request that produced a Codex tool call. Version 1 is the only known version.
+type CodexReplayProvenance struct {
+	Version    int  `json:"version"`
+	Advertised bool `json:"advertised"`
+}
+
 // ToolCall is a tool invocation requested by the assistant.
 type ToolCall struct {
 	ID        string         `json:"id"`
@@ -288,6 +295,8 @@ type ToolCall struct {
 	// It is never persisted — a stored session records the order as the key
 	// order of the "arguments" object itself, exactly as pi writes it.
 	ArgumentsOrder OrderedObject `json:"-"`
+	// CodexReplayProvenance is nil when the call's origin is unknown.
+	CodexReplayProvenance *CodexReplayProvenance `json:"codexReplayProvenance,omitempty"`
 	// ThoughtSignature is a Google-specific opaque signature for reusing thought context.
 	ThoughtSignature string `json:"thoughtSignature,omitempty"`
 	// Namespace is the OpenAI Responses namespace for calls to dynamically
@@ -315,18 +324,27 @@ func (t ToolCall) OrderedArguments() any {
 // (see ArgumentsOrder).
 func (t ToolCall) MarshalJSON() ([]byte, error) {
 	return json.Marshal(struct {
-		ID               string `json:"id"`
-		Name             string `json:"name"`
-		Arguments        any    `json:"arguments"`
-		ThoughtSignature string `json:"thoughtSignature,omitempty"`
-		Namespace        string `json:"namespace,omitempty"`
+		ID                    string                 `json:"id"`
+		Name                  string                 `json:"name"`
+		Arguments             any                    `json:"arguments"`
+		ThoughtSignature      string                 `json:"thoughtSignature,omitempty"`
+		Namespace             string                 `json:"namespace,omitempty"`
+		CodexReplayProvenance *CodexReplayProvenance `json:"codexReplayProvenance,omitempty"`
 	}{
-		ID:               t.ID,
-		Name:             t.Name,
-		Arguments:        t.OrderedArguments(),
-		ThoughtSignature: t.ThoughtSignature,
-		Namespace:        t.Namespace,
+		ID:                    t.ID,
+		Name:                  t.Name,
+		Arguments:             t.OrderedArguments(),
+		ThoughtSignature:      t.ThoughtSignature,
+		Namespace:             t.Namespace,
+		CodexReplayProvenance: validCodexReplayProvenance(t.CodexReplayProvenance),
 	})
+}
+
+func validCodexReplayProvenance(p *CodexReplayProvenance) *CodexReplayProvenance {
+	if p != nil && p.Version == 1 {
+		return p
+	}
+	return nil
 }
 
 // UnmarshalJSON recovers the argument key order from the source bytes, as
@@ -334,16 +352,24 @@ func (t ToolCall) MarshalJSON() ([]byte, error) {
 // replays in the order pi's would.
 func (t *ToolCall) UnmarshalJSON(data []byte) error {
 	var raw struct {
-		ID               string          `json:"id"`
-		Name             string          `json:"name"`
-		Arguments        json.RawMessage `json:"arguments"`
-		ThoughtSignature string          `json:"thoughtSignature,omitempty"`
-		Namespace        string          `json:"namespace,omitempty"`
+		ID                    string          `json:"id"`
+		Name                  string          `json:"name"`
+		Arguments             json.RawMessage `json:"arguments"`
+		ThoughtSignature      string          `json:"thoughtSignature,omitempty"`
+		Namespace             string          `json:"namespace,omitempty"`
+		CodexReplayProvenance json.RawMessage `json:"codexReplayProvenance"`
 	}
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
 	}
 	*t = ToolCall{ID: raw.ID, Name: raw.Name, ThoughtSignature: raw.ThoughtSignature, Namespace: raw.Namespace}
+	var provenance struct {
+		Version    *int  `json:"version"`
+		Advertised *bool `json:"advertised"`
+	}
+	if json.Unmarshal(raw.CodexReplayProvenance, &provenance) == nil && provenance.Version != nil && *provenance.Version == 1 && provenance.Advertised != nil {
+		t.CodexReplayProvenance = &CodexReplayProvenance{Version: 1, Advertised: *provenance.Advertised}
+	}
 	if len(raw.Arguments) == 0 {
 		return nil
 	}

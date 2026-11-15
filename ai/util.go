@@ -15,6 +15,13 @@ func (m *AssistantMessage) Clone() *AssistantMessage {
 	}
 	cp := *m
 	cp.Content = append(ContentList(nil), m.Content...)
+	for i, content := range cp.Content {
+		if call, ok := content.(ToolCall); ok && call.CodexReplayProvenance != nil {
+			provenance := *call.CodexReplayProvenance
+			call.CodexReplayProvenance = &provenance
+			cp.Content[i] = call
+		}
+	}
 	if m.Diagnostics != nil {
 		cp.Diagnostics = append([]Diagnostic(nil), m.Diagnostics...)
 	}

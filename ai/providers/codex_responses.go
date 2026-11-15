@@ -23,7 +23,7 @@ var errCodexStreamUnauthorized = errors.New("Codex response failed: 401 unauthor
 // codexWireToolNames changes only names on the outbound Codex wire. Run this
 // after OnPayload: hooks must never get an alias or invalidate a prebuilt map.
 // The inverse map is request-local and only admits names actually declared.
-func codexWireToolNames(payload map[string]any, original, resolved []ai.Message) (map[string]string, error) {
+func codexWireToolNames(payload map[string]any, original, resolved []ai.Message, snapshots ...[]codexReplayCall) (map[string]string, error) {
 	declared := map[string]bool{}
 	for _, messages := range [][]ai.Message{original, resolved} {
 		for _, tool := range ai.GetDeclaredTools(messages) {
@@ -111,42 +111,69 @@ func codexWireToolNames(payload map[string]any, original, resolved []ai.Message)
 			return nil, err
 		}
 	}
-	if input, ok := payload["input"]; ok {
-		items, ok := input.([]any)
-		if !ok {
+	var input []any
+	if value, ok := payload["input"]; ok {
+		var valid bool
+		input, valid = value.([]any)
+		if !valid {
 			return nil, errors.New("Codex malformed input")
 		}
-		for _, entry := range items {
-			item, ok := entry.(map[string]any)
-			if !ok {
-				continue
-			}
-			switch item["type"] {
-			case "additional_tools", "tool_search_output":
+		for _, entry := range input {
+			if item, ok := entry.(map[string]any); ok && (item["type"] == "additional_tools" || item["type"] == "tool_search_output") {
 				if err := visitTools(item["tools"]); err != nil {
 					return nil, err
-				}
-			case "function_call", "custom_tool_call":
-				name, ok := item["name"].(string)
-				if !ok {
-					return nil, errors.New("Codex malformed historical tool call")
-				}
-				if declared[name] {
-					wireName, err := rewrite(name, false)
-					if err != nil {
-						return nil, err
-					}
-					item["name"] = wireName
-				} else if !codexValidHistoryName.MatchString(name) {
-					candidate, err := codexIsolatedName(name, declared, historical, alias)
-					if err != nil {
-						return nil, err
-					}
-					item["name"] = candidate
 				}
 			}
 		}
 	}
+	var source []codexReplayCall
+	if len(snapshots) > 0 {
+		source = snapshots[0]
+	}
+	statuses := codexReplayMatch(source, input)
+	reserved := map[string]bool{}
+	// Reserve canonical names as well as the final wire declarations and alias.
+	for name := range declared {
+		reserved[name] = true
+	}
+	for name := range wire {
+		reserved[name] = true
+	}
+	if alias != "" {
+		reserved[alias] = true
+	}
+	var isolate []int
+	for i, entry := range input {
+		item, ok := entry.(map[string]any)
+		if !ok || (item["type"] != "function_call" && item["type"] != "custom_tool_call") {
+			continue
+		}
+		name, ok := item["name"].(string)
+		if !ok {
+			return nil, errors.New("Codex malformed historical tool call")
+		}
+		mapped := name
+		if declared[name] {
+			var err error
+			mapped, err = rewrite(name, false)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if statuses[i] == "advertised" && codexValidHistoryName.MatchString(mapped) {
+			item["name"] = mapped
+		} else if reserved[mapped] || reserved[name] || !codexValidHistoryName.MatchString(name) {
+			isolate = append(isolate, i)
+		}
+	}
+	names, err := codexReplayIsolatedNames(input, reserved, isolate)
+	if err != nil {
+		return nil, err
+	}
+	for i, name := range names {
+		input[i].(map[string]any)["name"] = name
+	}
+
 	if choice, ok := payload["tool_choice"].(string); ok {
 		if choice != "auto" && choice != "none" && choice != "required" {
 			wireName, err := rewrite(choice, false)
@@ -272,7 +299,18 @@ func streamCodexResponsesWithToolChoice(ctx context.Context, model *ai.Model, re
 			return
 		}
 		resolved := ai.ResolveTranscript(req, getResponsesCompat(model).SupportsMidConvoSystemMessages)
-		input, err := responsesInput(model, resolved)
+		var replaySource []codexReplayCall
+		input, err := responsesInputWithCallObserver(model, resolved, func(item map[string]any, call ai.ToolCall) {
+			status := ""
+			if p := call.CodexReplayProvenance; p != nil && p.Version == 1 {
+				if p.Advertised {
+					status = "advertised"
+				} else {
+					status = "unadvertised"
+				}
+			}
+			replaySource = append(replaySource, codexReplaySnapshot(item, status))
+		})
 		if err != nil {
 			fail("Codex request input invalid")
 			return
@@ -361,7 +399,7 @@ func streamCodexResponsesWithToolChoice(ctx context.Context, model *ai.Model, re
 				params = replacement
 			}
 		}
-		wireNames, err := codexWireToolNames(params, req.Messages, resolved.Messages)
+		wireNames, err := codexWireToolNames(params, req.Messages, resolved.Messages, replaySource)
 		if err != nil {
 			fail("Codex payload tools invalid")
 			return
@@ -479,7 +517,12 @@ func streamCodexResponsesWithToolChoice(ctx context.Context, model *ai.Model, re
 			for _, queued := range held {
 				for i, content := range queued.Partial.Content {
 					if call, ok := content.(ai.ToolCall); ok && call.Name == "" {
-						call.Name = output.Content[i].(ai.ToolCall).Name
+						current := output.Content[i].(ai.ToolCall)
+						call.Name = current.Name
+						if current.CodexReplayProvenance != nil {
+							provenance := *current.CodexReplayProvenance
+							call.CodexReplayProvenance = &provenance
+						}
 						queued.Partial.Content[i] = call
 					}
 				}
@@ -542,6 +585,8 @@ func streamCodexResponsesWithToolChoice(ctx context.Context, model *ai.Model, re
 							return err
 						}
 						s.call.Name = name
+						_, advertised := wireNames[ev.Item.Name]
+						s.call.CodexReplayProvenance = &ai.CodexReplayProvenance{Version: 1, Advertised: advertised}
 						s.started = true
 						output.Content[s.index] = s.call
 						emit(ai.EventToolCallStart, s, "")
@@ -598,6 +643,8 @@ func streamCodexResponsesWithToolChoice(ctx context.Context, model *ai.Model, re
 							return errors.New("Codex tool name changed or undeclared")
 						}
 						s.call.Name = name
+						_, advertised := wireNames[ev.Item.Name]
+						s.call.CodexReplayProvenance = &ai.CodexReplayProvenance{Version: 1, Advertised: advertised}
 					}
 					if s.call.Name == "" {
 						return errors.New("Codex tool call has no name")
@@ -617,6 +664,10 @@ func streamCodexResponsesWithToolChoice(ctx context.Context, model *ai.Model, re
 					s.call.Arguments, _ = parseStreamingJSON(orEmptyJSON(raw))
 					output.Content[s.index] = s.call
 					tc := s.call
+					if tc.CodexReplayProvenance != nil {
+						provenance := *tc.CodexReplayProvenance
+						tc.CodexReplayProvenance = &provenance
+					}
 					push(ai.AssistantMessageEvent{Type: ai.EventToolCallEnd, ContentIndex: s.index, ToolCall: &tc, Partial: output.Clone()})
 				}
 				delete(slots, ev.slotKey())

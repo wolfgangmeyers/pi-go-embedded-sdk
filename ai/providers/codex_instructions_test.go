@@ -59,8 +59,18 @@ func TestCodexLeadingInstructionsOffline(t *testing.T) {
 				if payload["instructions"] != tc.instructions {
 					t.Error("instructions mismatch")
 				}
+				if tc.name == "continued with later system" {
+					input := payload["input"].([]any)
+					call := input[1].(map[string]any)
+					name, _ := call["name"].(string)
+					if !strings.HasPrefix(name, "unknown_") || !codexValidHistoryName.MatchString(name) {
+						t.Fatalf("legacy declared call not isolated: %q", name)
+					}
+					// Check all other wire fields, including the correlated result.
+					call["name"] = "read"
+				}
 				if !reflect.DeepEqual(payload["input"], tc.input) {
-					t.Error("input shape mismatch")
+					t.Errorf("input shape mismatch: %#v", payload["input"])
 				}
 				return &http.Response{StatusCode: http.StatusBadRequest, Body: io.NopCloser(strings.NewReader(`{"error":"synthetic"}`)), Header: make(http.Header)}, nil
 			}))

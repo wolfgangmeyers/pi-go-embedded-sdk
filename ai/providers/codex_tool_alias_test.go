@@ -33,7 +33,7 @@ func TestCodexWireAliasCollisionHistoryAndChoice(t *testing.T) {
 	}
 	wire := payload["tools"].([]map[string]any)
 	input := payload["input"].([]any)
-	if wire[0]["name"] != "mecha_worker_launch_2" || wire[0]["description"] != "unchanged" || !reflect.DeepEqual(wire[0]["parameters"], map[string]any{"type": "object"}) || input[0].(map[string]any)["name"] != "mecha_worker_launch_2" || input[0].(map[string]any)["call_id"] != "original" || payload["tool_choice"].(map[string]any)["name"] != "mecha_worker_launch_2" {
+	if wire[0]["name"] != "mecha_worker_launch_2" || wire[0]["description"] != "unchanged" || !reflect.DeepEqual(wire[0]["parameters"], map[string]any{"type": "object"}) || !strings.HasPrefix(input[0].(map[string]any)["name"].(string), "unknown_") || input[0].(map[string]any)["call_id"] != "original" || payload["tool_choice"].(map[string]any)["name"] != "mecha_worker_launch_2" {
 		t.Fatalf("wire alias mismatch: %#v", payload)
 	}
 	if system.ToolsAdded[0].Name != "mecha_worker.launch" {
@@ -326,8 +326,11 @@ func TestCodexUndeclaredCanonicalStreamAndReplay(t *testing.T) {
 			found := false
 			for _, v := range input {
 				item, ok := v.(map[string]any)
-				if ok && item["type"] == "function_call" && item["name"] == alias {
+				if ok && item["type"] == "function_call" && item["call_id"] == "call_1" {
 					found = true
+					if item["name"] == alias {
+						t.Error("unadvertised historical call promoted to declared alias")
+					}
 				}
 			}
 			if !found {
@@ -356,7 +359,15 @@ data: {"type":"response.completed","response":{"status":"completed"}}
 	if result.StopReason != ai.StopToolUse || len(result.Content) != 1 || result.Content[0].(ai.ToolCall).Name != "mecha_worker.launch" {
 		t.Fatalf("stream: %#v", result)
 	}
-	req.Messages = append(req.Messages, *result, ai.ToolResultMessage{ToolCallID: "call_1|fc_1", ToolName: "mecha_worker.launch", Content: ai.ContentList{ai.TextContent{Text: "unavailable"}}, IsError: true})
+	persisted, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := ai.UnmarshalMessage(persisted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Messages = append(req.Messages, reloaded, ai.ToolResultMessage{ToolCallID: "call_1|fc_1", ToolName: "mecha_worker.launch", Content: ai.ContentList{ai.TextContent{Text: "unavailable"}}, IsError: true})
 	req.Tools = []ai.Tool{{Name: "mecha_worker.launch", Parameters: &ai.Schema{Type: "object"}}}
 	stream = ai.StreamSimple(context.Background(), model, req, opts)
 	for range stream.Events() {
@@ -439,8 +450,7 @@ func TestCodexAliasManyHistoricalCollisions(t *testing.T) {
 	}
 }
 
-// Replay cannot establish whether the historical canonical call was authorized.
-// Preserve established mapping when declared, without claiming provenance.
+// Legacy canonical history cannot establish authorization and must be isolated.
 func TestCodexCanonicalHistoryDeclarationTransitions(t *testing.T) {
 	for _, declared := range []bool{false, true} {
 		t.Run(fmt.Sprint(declared), func(t *testing.T) {
@@ -448,7 +458,7 @@ func TestCodexCanonicalHistoryDeclarationTransitions(t *testing.T) {
 			if declared {
 				system.ToolsAdded = []ai.Tool{{Name: "mecha_worker.launch"}}
 			}
-			input := []any{map[string]any{"type": "function_call", "name": "mecha_worker.launch"}}
+			input := []any{map[string]any{"type": "function_call", "name": "mecha_worker.launch", "call_id": "call_1", "arguments": "{}"}, map[string]any{"type": "function_call_output", "call_id": "call_1", "output": "unavailable"}}
 			payload := map[string]any{"input": input}
 			if declared {
 				payload["tools"] = []map[string]any{{"name": "mecha_worker.launch"}}
@@ -458,11 +468,13 @@ func TestCodexCanonicalHistoryDeclarationTransitions(t *testing.T) {
 				t.Fatal(err)
 			}
 			replay := input[0].(map[string]any)["name"].(string)
-			if declared && names[replay] != "mecha_worker.launch" {
-				t.Fatalf("lost replay mapping: %q %v", replay, names)
+			if !strings.HasPrefix(replay, "unknown_") || names[replay] != "" {
+				t.Fatalf("legacy replay not isolated: %q %v", replay, names)
 			}
-			if !declared && (!strings.HasPrefix(replay, "unknown_") || names[replay] != "") {
-				t.Fatalf("unknown replay: %q %v", replay, names)
+			call := input[0].(map[string]any)
+			result := input[1].(map[string]any)
+			if call["call_id"] != "call_1" || result["call_id"] != "call_1" || result["output"] != "unavailable" {
+				t.Fatalf("lost correlation: %#v", input)
 			}
 		})
 	}

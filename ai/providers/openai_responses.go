@@ -1251,6 +1251,10 @@ func convertResponsesTools(tools []ai.Tool, compat responsesCompat, toolSearchRe
 // block carries an unparseable thinkingSignature (pi's JSON.parse throws and
 // fails the stream).
 func responsesInput(model *ai.Model, req ai.TranscriptContext) ([]any, error) {
+	return responsesInputWithCallObserver(model, req, nil)
+}
+
+func responsesInputWithCallObserver(model *ai.Model, req ai.TranscriptContext, observe func(map[string]any, ai.ToolCall)) ([]any, error) {
 	var items []any
 
 	compat := getResponsesCompat(model)
@@ -1395,6 +1399,9 @@ func responsesInput(model *ai.Model, req ai.TranscriptContext) ([]any, error) {
 					}
 					if itemID != "" {
 						item["id"] = itemID
+					}
+					if observe != nil {
+						observe(item, v)
 					}
 					output = append(output, item)
 				}
