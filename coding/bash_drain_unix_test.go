@@ -15,6 +15,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // waitForFile is a hang guard, not a timing requirement for the behavior.
@@ -38,7 +40,8 @@ func signalFile(t *testing.T, path string) {
 	}
 }
 
-// releaseWatchdog bounds descendants even if a test stalls before cleanup.
+// releaseWatchdog releases gates on cleanup or a stalled test. Shell loops also
+// have independent iteration bounds if their temporary directory is removed.
 func releaseWatchdog(t *testing.T, paths ...string) {
 	t.Helper()
 	release := func() {
@@ -46,8 +49,33 @@ func releaseWatchdog(t *testing.T, paths ...string) {
 			_ = os.WriteFile(path, nil, 0600)
 		}
 	}
-	timer := time.AfterFunc(20*time.Second, release)
-	t.Cleanup(func() { timer.Stop(); release() })
+	done := make(chan struct{})
+	timer := time.AfterFunc(20*time.Second, func() { defer close(done); release() })
+	t.Cleanup(func() {
+		if !timer.Stop() {
+			<-done
+		}
+		release()
+	})
+}
+
+// witnessAlive checks the descriptor itself, not whether a reader goroutine
+// happened to be scheduled. The handshake must already have been consumed.
+func witnessAlive(f *os.File) error {
+	p := []unix.PollFd{{Fd: int32(f.Fd()), Events: unix.POLLIN}}
+	for {
+		n, err := unix.Poll(p, 0)
+		if err == unix.EINTR {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if n != 0 {
+			return errors.New("witness descriptor is readable or closed")
+		}
+		return nil
+	}
 }
 
 func TestBashDrainSlowCallbackPreservesBufferedTail(t *testing.T) {
@@ -62,8 +90,8 @@ func TestBashDrainSlowCallbackPreservesBufferedTail(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "sh", "-c", `
-		(while [ ! -f "$3" ]; do sleep .01; done; touch "$4") &
-		printf head; while [ ! -f "$1" ]; do sleep .01; done; printf tail; touch "$2"
+		(i=0; while [ ! -f "$3" ] && [ "$i" -lt 2000 ]; do sleep .01; i=$((i+1)); done; touch "$4") &
+		printf head; i=0; while [ ! -f "$1" ] && [ "$i" -lt 2000 ]; do sleep .01; i=$((i+1)); done; printf tail; touch "$2"
 	`, "sh", gate, exited, release, descendantDone)
 	var output bytes.Buffer
 	first := true
@@ -98,7 +126,7 @@ func TestBashDrainDescendantIdleAndOutput(t *testing.T) {
 		done := make(chan error, 1)
 		var out bytes.Buffer
 		go func() {
-			done <- runBashCommand(exec.CommandContext(ctx, "sh", "-c", `(while [ ! -f "$1" ]; do sleep .01; done; touch "$2") & printf done`, "sh", release, exited), &out)
+			done <- runBashCommand(exec.CommandContext(ctx, "sh", "-c", `(i=0; while [ ! -f "$1" ] && [ "$i" -lt 2000 ]; do sleep .01; i=$((i+1)); done; touch "$2") & printf done`, "sh", release, exited), &out)
 		}()
 		select {
 		case err := <-done:
@@ -122,10 +150,10 @@ func TestBashDrainDescendantIdleAndOutput(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		cmd := exec.CommandContext(ctx, "sh", "-c", `
-			(trap 'touch "$1/done"' 0; printf a; while [ ! -f "$1/a" ]; do sleep .01; done
-			 printf b; while [ ! -f "$1/b" ]; do sleep .01; done
+			(trap 'touch "$1/done"' 0; printf a; i=0; while [ ! -f "$1/a" ] && [ "$i" -lt 2000 ]; do sleep .01; i=$((i+1)); done
+			 printf b; i=0; while [ ! -f "$1/b" ] && [ "$i" -lt 2000 ]; do sleep .01; i=$((i+1)); done
 			 printf c) &
-			while [ ! -f "$1/done" ]; do sleep .01; done
+			i=0; while [ ! -f "$1/done" ] && [ "$i" -lt 2000 ]; do sleep .01; i=$((i+1)); done
 		`, "sh", dir)
 		var out bytes.Buffer
 		err := runBashCommand(cmd, writerFunc(func(p []byte) (int, error) {
@@ -166,7 +194,7 @@ func TestBashDrainContinuousDescendantIsBounded(t *testing.T) {
 	defer cancel()
 	releasePath := filepath.Join(t.TempDir(), "release")
 	releaseWatchdog(t, releasePath)
-	cmd := exec.CommandContext(ctx, "sh", "-c", `(while [ ! -f "$1" ]; do printf x; sleep .01; done) & exit 0`, "sh", releasePath)
+	cmd := exec.CommandContext(ctx, "sh", "-c", `(i=0; while [ ! -f "$1" ] && [ "$i" -lt 2000 ]; do printf x; sleep .01; i=$((i+1)); done) & exit 0`, "sh", releasePath)
 	setProcessGroup(cmd)
 	cmd.Cancel = func() error { return killProcessTree(cmd) }
 	start := time.Now()
@@ -189,7 +217,7 @@ func TestBashDrainCancelAfterParentExit(t *testing.T) {
 	defer writer.Close()
 	releasePath := filepath.Join(t.TempDir(), "release")
 	releaseWatchdog(t, releasePath)
-	cmd := exec.CommandContext(ctx, "sh", "-c", `(printf R >&3; while [ ! -f "$1" ]; do sleep .01; done) & printf ready; exit 0`, "sh", releasePath)
+	cmd := exec.CommandContext(ctx, "sh", "-c", `(printf R >&3; i=0; while [ ! -f "$1" ] && [ "$i" -lt 2000 ]; do sleep .01; i=$((i+1)); done) & printf ready; exit 0`, "sh", releasePath)
 	cmd.ExtraFiles = []*os.File{writer}
 	setProcessGroup(cmd)
 	cmd.Cancel = func() error { return killProcessTree(cmd) }
@@ -234,8 +262,6 @@ func TestBashDrainCancelAfterParentExit(t *testing.T) {
 		close(release)
 		t.Fatal("witness handshake timed out")
 	}
-	closed := make(chan error, 1)
-	go func() { _, err := io.Copy(io.Discard, reader); closed <- err }()
 	// The blocked callback prevents reaping while waitid observes actual exit.
 	exited := make(chan error, 1)
 	go func() { exited <- observeBashExit(cmd.Process.Pid) }()
@@ -249,12 +275,12 @@ func TestBashDrainCancelAfterParentExit(t *testing.T) {
 		close(release)
 		t.Fatal("shell did not exit")
 	}
-	select {
-	case err := <-closed:
+	if err := witnessAlive(reader); err != nil {
 		close(release)
 		t.Fatalf("witness exited before cancellation: %v", err)
-	default:
 	}
+	closed := make(chan error, 1)
+	go func() { _, err := io.Copy(io.Discard, reader); closed <- err }()
 	cancel()
 	close(release)
 	select {
@@ -324,7 +350,7 @@ func TestBashDrainLimitReportedByOperations(t *testing.T) {
 	dir := t.TempDir()
 	releaseWatchdog(t, filepath.Join(dir, "release"))
 	ops := LocalBashOperations(bashShellConfig)
-	code, err := ops.Exec(ctx, `(while [ ! -f release ]; do printf x; sleep .01; done) & exit 0`, dir, BashExecOptions{Env: os.Environ()})
+	code, err := ops.Exec(ctx, `(i=0; while [ ! -f release ] && [ "$i" -lt 2000 ]; do printf x; sleep .01; i=$((i+1)); done) & exit 0`, dir, BashExecOptions{Env: os.Environ()})
 	if code == nil || *code != 0 || !errors.Is(err, ErrBashOutputIncomplete) {
 		t.Fatalf("code %v error %v", code, err)
 	}
@@ -341,7 +367,7 @@ func TestBashDrainCancellationClassificationAfterExit(t *testing.T) {
 	var once sync.Once
 	done := make(chan error, 1)
 	go func() {
-		_, err := ops.Exec(ctx, `echo $$ > pid; (printf x; while [ ! -f release ]; do sleep .01; done) & exit 0`, dir, BashExecOptions{Env: os.Environ(), OnData: func([]byte) { once.Do(func() { close(ready); <-release }) }})
+		_, err := ops.Exec(ctx, `echo $$ > pid; (printf x; i=0; while [ ! -f release ] && [ "$i" -lt 2000 ]; do sleep .01; i=$((i+1)); done) & exit 0`, dir, BashExecOptions{Env: os.Environ(), OnData: func([]byte) { once.Do(func() { close(ready); <-release }) }})
 		done <- err
 	}()
 	select {
@@ -396,4 +422,28 @@ func TestBashIncompletePreservesNonzeroExit(t *testing.T) {
 	if !errors.Is(err, ErrBashOutputIncomplete) || !strings.Contains(err.Error(), "Command exited with code 7") {
 		t.Fatalf("error %v", err)
 	}
+}
+
+func TestWitnessAlivePoll(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	defer w.Close()
+	if err := witnessAlive(r); err != nil {
+		t.Fatalf("open witness: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := witnessAlive(r); err == nil {
+		t.Fatal("closed witness reported alive")
+	}
+}
+
+func TestReleaseWatchdogWithoutStartedProcess(t *testing.T) {
+	t.Run("no process", func(t *testing.T) {
+		releaseWatchdog(t, filepath.Join(t.TempDir(), "release"))
+	})
 }

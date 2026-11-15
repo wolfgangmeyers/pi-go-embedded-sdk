@@ -25,6 +25,8 @@ func TestBashDrainFaults(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			defer pr.Close()
+			defer pw.Close()
 			cmd := exec.Command("sh", "-c", "exec sleep 30")
 			cmd.Stdout = pw
 			cmd.Stderr = pw
@@ -66,6 +68,8 @@ func TestBashDrainWakeAndExitStatus(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer pr.Close()
+	defer pw.Close()
 	cmd := exec.Command("sh", "-c", "printf hello; exit 7")
 	cmd.Stdout = pw
 	cmd.Stderr = pw
@@ -122,6 +126,8 @@ func TestBashWakePipeCloseOnExecConcurrentSpawn(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		// Register cleanup before any setup assertion can fail.
+		t.Cleanup(func() { r.Close(); w.Close() })
 		for _, f := range []*os.File{r, w} {
 			flags, err := unix.FcntlInt(f.Fd(), unix.F_GETFD, 0)
 			if err != nil || flags&unix.FD_CLOEXEC == 0 {
@@ -156,6 +162,8 @@ func TestBashDrainFailureUsesCancellationPolicy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer pr.Close()
+	defer pw.Close()
 	cmd := exec.CommandContext(context.Background(), "sleep", "30")
 	setProcessGroup(cmd)
 	called := make(chan struct{}, 1)
@@ -184,6 +192,8 @@ func TestBashDrainFailureAfterExitKillsGroupBeforeReap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer pr.Close()
+	defer pw.Close()
 	// The inherited pipe independently witnesses the descendant closing on
 	// cancellation. A controlled release and watchdog bound its lifetime.
 	ackRead, ackWrite, err := os.Pipe()
@@ -198,7 +208,7 @@ func TestBashDrainFailureAfterExitKillsGroupBeforeReap(t *testing.T) {
 	releaseWatchdog(t, release)
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "sh", "-c", `(printf R >&3; touch "$1"; while [ ! -f "$2" ]; do sleep .01; done) & while [ ! -f "$1" ]; do sleep .01; done; exit 0`, "sh", ready, release)
+	cmd := exec.CommandContext(ctx, "sh", "-c", `(printf R >&3; touch "$1"; i=0; while [ ! -f "$2" ] && [ "$i" -lt 2000 ]; do sleep .01; i=$((i+1)); done) & i=0; while [ ! -f "$1" ] && [ "$i" -lt 2000 ]; do sleep .01; i=$((i+1)); done; exit 0`, "sh", ready, release)
 	cmd.ExtraFiles = []*os.File{ackWrite}
 	setProcessGroup(cmd)
 	called := make(chan struct{}, 1)
@@ -246,13 +256,11 @@ func TestBashDrainFailureAfterExitKillsGroupBeforeReap(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("witness handshake timed out")
 	}
+	if err := witnessAlive(ackRead); err != nil {
+		t.Fatalf("witness exited before cancellation: %v", err)
+	}
 	closed := make(chan error, 1)
 	go func() { _, err := io.Copy(io.Discard, ackRead); closed <- err }()
-	select {
-	case err := <-closed:
-		t.Fatalf("witness exited before cancellation: %v", err)
-	default:
-	}
 	ops := defaultBashDrainOps
 	sentinel := errors.New("after exit")
 	ops.read = func(int, []byte) (int, error) { return 0, sentinel }
