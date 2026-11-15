@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"sync"
 
 	"github.com/sky-valley/pi/ai"
@@ -411,6 +412,16 @@ func streamAssistantResponse(ctx context.Context, agentCtx *AgentContext, config
 				switch content.(type) {
 				case ai.TextContent, ai.ThinkingContent:
 					m.Content = append(m.Content, content)
+				case *ai.TextContent:
+					if c := content.(*ai.TextContent); c != nil {
+						snapshot := *c
+						m.Content = append(m.Content, &snapshot)
+					}
+				case *ai.ThinkingContent:
+					if c := content.(*ai.ThinkingContent); c != nil {
+						snapshot := *c
+						m.Content = append(m.Content, &snapshot)
+					}
 				}
 			}
 			m.StopReason, m.ErrorMessage, m.ThinkingLevel = stop, reason, thinkingLevel
@@ -427,9 +438,13 @@ func streamAssistantResponse(ctx context.Context, agentCtx *AgentContext, config
 				continue
 			}
 			partial = event.Partial
-			agentCtx.Messages = append(agentCtx.Messages, partial)
-			addedPartial = true
-			mustEmit(emit, AgentEvent{Type: EvMessageStart, Message: partial.Clone()})
+			if addedPartial {
+				agentCtx.Messages[len(agentCtx.Messages)-1] = partial
+			} else {
+				agentCtx.Messages = append(agentCtx.Messages, partial)
+				addedPartial = true
+				mustEmit(emit, AgentEvent{Type: EvMessageStart, Message: partial.Clone()})
+			}
 
 		case ai.EventTextStart, ai.EventTextDelta, ai.EventTextEnd,
 			ai.EventThinkingStart, ai.EventThinkingDelta, ai.EventThinkingEnd,
@@ -454,11 +469,16 @@ func streamAssistantResponse(ctx context.Context, agentCtx *AgentContext, config
 			}
 			if final == nil {
 				final = failure("provider stream returned a terminal event without a message")
+			} else if (event.Reason != "" && final.StopReason != "" && event.Reason != final.StopReason) || (event.Type == ai.EventDone && (event.Reason == ai.StopError || event.Reason == ai.StopAborted)) {
+				final = failure("provider stream returned contradictory terminal reasons")
 			} else {
 				final = final.Clone()
 				final.ThinkingLevel = thinkingLevel
 				if event.Type == ai.EventError && final.StopReason != ai.StopError && final.StopReason != ai.StopAborted {
 					final.StopReason = ai.StopError
+				}
+				if event.Type == ai.EventError && strings.TrimSpace(final.ErrorMessage) == "" {
+					final.ErrorMessage = "provider stream returned an error"
 				}
 			}
 			if addedPartial {
