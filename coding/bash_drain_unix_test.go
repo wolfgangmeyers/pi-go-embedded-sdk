@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -41,15 +42,12 @@ func TestBashDrainSlowCallbackPreservesBufferedTail(t *testing.T) {
 	exited := filepath.Join(dir, "exited")
 	release := filepath.Join(dir, "release")
 	defer signalFile(t, release)
-	// The descendant retains the pipe and confirms the actual parent exit (and
-	// reap), rather than merely observing a marker written before exit.
+	// The descendant retains the pipe while the callback is blocked.
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "sh", "-c", `
-		parent=$$
-		(while kill -0 "$parent" 2>/dev/null; do sleep .01; done
-		 touch "$2"; while [ ! -f "$3" ]; do sleep .01; done) &
-		printf head; while [ ! -f "$1" ]; do sleep .01; done; printf tail
+		(while [ ! -f "$3" ]; do sleep .01; done) &
+		printf head; while [ ! -f "$1" ]; do sleep .01; done; printf tail; touch "$2"
 	`, "sh", gate, exited, release)
 	var output bytes.Buffer
 	first := true
@@ -59,9 +57,9 @@ func TestBashDrainSlowCallbackPreservesBufferedTail(t *testing.T) {
 			first = false
 			signalFile(t, gate)
 			if waitForFile(t, exited) {
-				// Make the callback exceed the post-exit idle window while the
+				// Make the callback exceed the post-exit window while the
 				// tail is already buffered and the descendant holds the pipe.
-				time.Sleep(3 * bashExitStdioGrace)
+				time.Sleep(2 * bashExitStdioGrace)
 			}
 			signalFile(t, release)
 		}
@@ -137,5 +135,43 @@ func TestBashDrainCancellation(t *testing.T) {
 	var exit *exec.ExitError
 	if !errors.As(err, &exit) || out.String() != "ready" {
 		t.Fatalf("output %q err %v", out.String(), err)
+	}
+}
+
+func TestBashDrainContinuousDescendantIsBounded(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "sh", "-c", `(while :; do printf x; done) & exit 0`)
+	setProcessGroup(cmd)
+	cmd.Cancel = func() error { return killProcessTree(cmd) }
+	start := time.Now()
+	err := runBashCommand(cmd, writerFunc(func(p []byte) (int, error) { return len(p), nil }))
+	if err != nil || time.Since(start) > 4*time.Second {
+		t.Fatalf("err %v elapsed %v", err, time.Since(start))
+	}
+}
+
+func TestBashDrainCancelAfterParentExit(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "sh", "-c", `(while :; do printf x; done) & exit 0`)
+	setProcessGroup(cmd)
+	cmd.Cancel = func() error { return killProcessTree(cmd) }
+	done := make(chan error, 1)
+	ready := make(chan struct{})
+	var once sync.Once
+	go func() {
+		done <- runBashCommand(cmd, writerFunc(func(p []byte) (int, error) { once.Do(func() { close(ready) }); return len(p), nil }))
+	}()
+	<-ready
+	// The observer leaves the shell waitable; waitid observes its actual exit.
+	if err := observeBashExit(cmd.Process.Pid); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("cancellation did not finish drain")
 	}
 }

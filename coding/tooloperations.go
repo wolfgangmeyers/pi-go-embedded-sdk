@@ -152,7 +152,7 @@ func LocalBashOperations(config shellToolConfig) BashOperations {
 			setProcessGroup(cmd)
 			cmd.Cancel = func() error { return killProcessTree(cmd) }
 			// Bound os/exec-owned I/O (such as legacy WSL stdin) after cancellation.
-			// The manually owned output pipe has its own post-exit idle policy.
+			// The manually owned output pipe has its own post-exit drain policy.
 			cmd.WaitDelay = time.Second
 
 			runErr := runBashCommand(cmd, onDataWriter(options.OnData))

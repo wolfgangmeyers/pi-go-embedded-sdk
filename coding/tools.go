@@ -1109,20 +1109,12 @@ func bashWallTimeSeconds(elapsed time.Duration) float64 {
 
 const bashUpdateThrottle = 100 * time.Millisecond
 
-// bashExitStdioGrace is the idle window we keep reading merged stdout/stderr
-// after the process exits. A detached descendant can hold the pipe open and keep
-// writing past exit; we must not destroy the stream on a fixed deadline measured
-// from exit or its tail is silently lost (port of pi#5303 / 3fa40956). Instead
-// the timer is re-armed on every chunk, so an actively writing pipe keeps us
-// reading while a quiet held-open handle still releases after the grace elapses.
-const bashExitStdioGrace = 100 * time.Millisecond
+// After shell exit, capture descendant output for at most this fixed window.
+// EOF releases immediately; a continuously writing descendant cannot extend it.
+// A synchronous output callback can still delay completion.
+const bashExitStdioGrace = time.Second
 
-// runBashCommand starts cmd with stdout+stderr merged onto a single pipe (2>&1
-// interleaving, like pi's shared onData handler), streams the merged output into
-// u, and waits for the process. After exit it drains the pipe on a re-arming
-// idle grace rather than a fixed deadline so output a detached descendant writes
-// past exit is captured (port of 3fa40956). It returns the same error cmd.Wait
-// would on success, or an error that also reports output drain failures.
+// runBashCommand merges stdout and stderr and drains them after shell exit.
 func runBashCommand(cmd *exec.Cmd, w io.Writer) error {
 	pr, pw, err := os.Pipe()
 	if err != nil {
@@ -1132,6 +1124,7 @@ func runBashCommand(cmd *exec.Cmd, w io.Writer) error {
 	// with stdout in write order.
 	cmd.Stdout = pw
 	cmd.Stderr = pw
+	finishCancel := guardBashCancel(cmd)
 	if err := cmd.Start(); err != nil {
 		pw.Close()
 		pr.Close()
@@ -1140,7 +1133,7 @@ func runBashCommand(cmd *exec.Cmd, w io.Writer) error {
 	// The parent must drop its write end or pr never sees EOF.
 	pw.Close()
 
-	return drainBashPipe(cmd, pr, w)
+	return drainBashPipe(cmd, pr, w, finishCancel)
 }
 
 func argFloat(params map[string]any, key string) (float64, bool) {

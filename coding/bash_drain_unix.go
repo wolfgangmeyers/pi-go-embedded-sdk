@@ -8,10 +8,31 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sys/unix"
 )
+
+// Disable group cancellation before reaping, including os/exec's context watcher.
+func guardBashCancel(cmd *exec.Cmd) func() {
+	if cmd.Cancel == nil {
+		return func() {}
+	}
+	cancel := cmd.Cancel
+	var mu sync.Mutex
+	active := true
+	cmd.Cancel = func() error {
+		mu.Lock()
+		defer mu.Unlock()
+		if !active {
+			return os.ErrProcessDone
+		}
+		return cancel()
+	}
+	return func() { mu.Lock(); active = false; mu.Unlock() }
+}
 
 type bashDrainOps struct {
 	setNonblock func(int, bool) error
@@ -31,18 +52,23 @@ func stopBashOnDrainFailure(cmd *exec.Cmd) {
 	}
 }
 
-// drainBashPipe owns the reader until EOF or a post-exit idle interval.
+// drainBashPipe owns the reader until EOF or the bounded post-exit window.
 // Callbacks are synchronous and can block indefinitely.
-func drainBashPipe(cmd *exec.Cmd, pr *os.File, w io.Writer) error {
-	return drainBashPipeWithOps(cmd, pr, w, defaultBashDrainOps)
+func drainBashPipe(cmd *exec.Cmd, pr *os.File, w io.Writer, finish func()) error {
+	return drainBashPipeWithOpsFinish(cmd, pr, w, defaultBashDrainOps, finish)
 }
 
 func drainBashPipeWithOps(cmd *exec.Cmd, pr *os.File, w io.Writer, ops bashDrainOps) error {
+	return drainBashPipeWithOpsFinish(cmd, pr, w, ops, func() {})
+}
+
+func drainBashPipeWithOpsFinish(cmd *exec.Cmd, pr *os.File, w io.Writer, ops bashDrainOps, finish func()) error {
 	fd := int(pr.Fd())
 	failSetup := func(err error) error {
 		// Close before waiting: the child must not block on an undrained pipe.
 		_ = pr.Close()
 		stopBashOnDrainFailure(cmd)
+		finish()
 		return errors.Join(drainFailure(err), cmd.Wait())
 	}
 	if err := ops.setNonblock(fd, true); err != nil {
@@ -52,19 +78,36 @@ func drainBashPipeWithOps(cmd *exec.Cmd, pr *os.File, w io.Writer, ops bashDrain
 	if err != nil {
 		return failSetup(fmt.Errorf("bash output wake pipe: %w", err))
 	}
+	var exitAt atomic.Int64
 	done := make(chan error, 1)
 	go func() {
 		defer pr.Close()
 		defer wakeRead.Close()
 		buf := make([]byte, 32*1024)
-		var idleSince time.Time
+		var deadline time.Time
 		exited := false
 		for {
+			if !exited {
+				if ns := exitAt.Load(); ns != 0 {
+					exited = true
+					deadline = time.Unix(0, ns).Add(bashExitStdioGrace)
+				}
+			}
+			// One final nonblocking read preserves a buffered tail if a callback
+			// ran past the deadline, without following an active writer forever.
+			expired := exited && !time.Now().Before(deadline)
 			n, err := ops.read(fd, buf)
 			if n > 0 {
 				_, _ = w.Write(buf[:n])
-				idleSince = time.Time{}
+				if expired {
+					done <- nil
+					return
+				}
 				continue
+			}
+			if expired && (errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EWOULDBLOCK)) {
+				done <- nil
+				return
 			}
 			if err == nil {
 				done <- nil
@@ -79,10 +122,7 @@ func drainBashPipeWithOps(cmd *exec.Cmd, pr *os.File, w io.Writer, ops bashDrain
 			}
 			timeout := -1
 			if exited {
-				if idleSince.IsZero() {
-					idleSince = time.Now()
-				}
-				remaining := bashExitStdioGrace - time.Since(idleSince)
+				remaining := time.Until(deadline)
 				if remaining <= 0 {
 					done <- nil
 					return
@@ -111,26 +151,41 @@ func drainBashPipeWithOps(cmd *exec.Cmd, pr *os.File, w io.Writer, ops bashDrain
 			}
 			if !exited && fds[1].Revents != 0 {
 				exited = true
+				deadline = time.Unix(0, exitAt.Load()).Add(bashExitStdioGrace)
 			}
 		}
 	}()
-	waited := make(chan error, 1)
-	go func() { waited <- cmd.Wait() }()
-	var waitErr, drainErr error
+	// Observe exit without reaping: until Wait, the leader's PID remains
+	// reserved, so cancellation on a drain failure cannot hit a reused group.
+	exited := make(chan error, 1)
+	go func() {
+		err := observeBashExit(cmd.Process.Pid)
+		exitAt.Store(time.Now().UnixNano())
+		exited <- err
+	}()
+	var drainErr error
 	select {
-	case waitErr = <-waited:
-		// Closing the write end wakes poll, even if exit races the first poll.
+	case err := <-exited:
+		if err != nil {
+			stopBashOnDrainFailure(cmd)
+			drainErr = drainFailure(fmt.Errorf("bash exit observation: %w", err))
+		}
 		_ = wakeWrite.Close()
-		drainErr = <-done
+		readErr := <-done
+		if readErr != nil {
+			stopBashOnDrainFailure(cmd)
+		}
+		drainErr = errors.Join(drainErr, readErr)
 	case drainErr = <-done:
 		if drainErr != nil {
 			stopBashOnDrainFailure(cmd)
 		}
-		waitErr = <-waited
+		if err := <-exited; err != nil {
+			stopBashOnDrainFailure(cmd)
+			drainErr = errors.Join(drainErr, drainFailure(fmt.Errorf("bash exit observation: %w", err)))
+		}
 		_ = wakeWrite.Close()
 	}
-	if drainErr == nil {
-		return waitErr
-	}
-	return errors.Join(waitErr, drainErr)
+	finish()
+	return errors.Join(cmd.Wait(), drainErr)
 }

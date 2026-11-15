@@ -64,9 +64,7 @@ func TestBashStreamsPartialOutput(t *testing.T) {
 
 // TestBashCapturesOutputPastExit ports upstream 3fa40956 (regression for pi#5303):
 // a short-lived shell exits immediately, but a detached subshell holds the merged
-// stdout pipe open and emits ticks every 50ms — the last well past the 100ms exit
-// grace. The fix re-arms the idle grace per chunk, so the tail must still be
-// captured rather than truncated at a fixed deadline from exit.
+// stdout pipe open and emits ticks every 50ms within the bounded exit window.
 func TestBashCapturesOutputPastExit(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("uses /bin/sh detached subshell")
@@ -90,8 +88,7 @@ func TestBashCapturesOutputPastExit(t *testing.T) {
 
 // TestBashReleasesPromptlyOnQuietHeldPipe ports the second case of 3fa40956: a
 // detached sleeper inherits the stdout pipe and holds it open for a long time
-// without writing. EOF never arrives, so we must release via the idle grace
-// rather than block on the open handle.
+// without writing. The bounded window releases the open handle.
 func TestBashReleasesPromptlyOnQuietHeldPipe(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("uses /bin/sh detached subshell")
@@ -108,7 +105,7 @@ func TestBashReleasesPromptlyOnQuietHeldPipe(t *testing.T) {
 	if !strings.Contains(got, "DONE") {
 		t.Fatalf("expected DONE in output, got %q", got)
 	}
-	// Must not wait for the 30s sleeper; the idle grace releases us well under a second.
+	// Must not wait for the 30s sleeper; the bounded window releases us.
 	if elapsed > 2*time.Second {
 		t.Fatalf("expected prompt release via idle grace, took %s", elapsed)
 	}

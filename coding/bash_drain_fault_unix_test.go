@@ -73,7 +73,7 @@ func TestBashDrainWakeAndExitStatus(t *testing.T) {
 	}
 	pw.Close()
 	var out bytes.Buffer
-	err = drainBashPipe(cmd, pr, &out)
+	err = drainBashPipe(cmd, pr, &out, func() {})
 	var exit *exec.ExitError
 	if !errors.As(err, &exit) || exit.ExitCode() != 7 || out.String() != "hello" {
 		t.Fatalf("output %q error %v", out.String(), err)
@@ -175,5 +175,36 @@ func TestBashDrainFailureUsesCancellationPolicy(t *testing.T) {
 	case <-called:
 	default:
 		t.Fatal("cancellation policy not invoked")
+	}
+}
+
+func TestBashDrainFailureAfterExitKillsGroupBeforeReap(t *testing.T) {
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.CommandContext(context.Background(), "sh", "-c", `(sleep 30) & exit 0`)
+	setProcessGroup(cmd)
+	called := make(chan struct{}, 1)
+	cmd.Cancel = func() error { called <- struct{}{}; return killProcessTree(cmd) }
+	cmd.Stdout, cmd.Stderr = pw, pw
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	pw.Close()
+	if err := observeBashExit(cmd.Process.Pid); err != nil {
+		t.Fatal(err)
+	}
+	ops := defaultBashDrainOps
+	sentinel := errors.New("after exit")
+	ops.read = func(int, []byte) (int, error) { return 0, sentinel }
+	err = drainBashPipeWithOps(cmd, pr, io.Discard, ops)
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("error %v", err)
+	}
+	select {
+	case <-called:
+	default:
+		t.Fatal("group cancellation not called")
 	}
 }
