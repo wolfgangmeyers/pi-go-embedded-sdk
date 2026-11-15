@@ -650,7 +650,7 @@ func executeToolCallsSequential(ctx context.Context, current *AgentContext, msg 
 
 // executeAdmittedCallsParallel commits each call to execution immediately after
 // admission. Steering can skip only calls that have not yet been admitted. Once
-// admitted, a call must run even if steering or cancellation arrives later.
+// admitted, a call must settle even if steering or cancellation arrives later.
 func executeAdmittedCallsParallel(ctx context.Context, current *AgentContext, msg *ai.AssistantMessage, calls []ai.ToolCall, config AgentLoopConfig, emit EventSink) executedBatch {
 	return executeAdmittedCallsParallelWithPublication(ctx, current, msg, calls, config, emit, nil)
 }
@@ -1077,9 +1077,18 @@ func prepareToolCall(ctx context.Context, current *AgentContext, msg *ai.Assista
 			return res
 		}
 	}
-	if hooks.ReplayToolResult != nil && !aborted(ctx) {
+	if hooks.ReplayToolResult != nil {
 		// Only an admitted, schema-valid call may request a saved complete result.
-		replay, err := hooks.ReplayToolResult(ctx, BeforeToolCallContext{AssistantMessage: msg, ToolCall: prepared, Args: validated, Context: current})
+		var replay *ai.ToolResultMessage
+		var err error
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					panic(toolAdmissionAbort{err: fmt.Errorf("tool replay panicked: %s", panicMessage(r))})
+				}
+			}()
+			replay, err = hooks.ReplayToolResult(ctx, BeforeToolCallContext{AssistantMessage: msg, ToolCall: prepared, Args: validated, Context: current})
+		}()
 		if err != nil {
 			panic(toolAdmissionAbort{err: err})
 		}
@@ -1089,6 +1098,11 @@ func prepareToolCall(ctx context.Context, current *AgentContext, msg *ai.Assista
 			}
 			return prepareResult{replay: replay}
 		}
+	}
+	// Once intent is admitted, cancellation cannot turn an unresolved call into
+	// an error result or allow execution without first resolving replay.
+	if hooks.BeforeToolExecute != nil && aborted(ctx) {
+		panic(toolAdmissionAbort{err: ctx.Err()})
 	}
 	return prepareResult{prepared: &preparedToolCall{toolCall: tc, tool: tool, args: validated}}
 }
