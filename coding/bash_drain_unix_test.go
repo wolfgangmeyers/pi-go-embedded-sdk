@@ -14,32 +14,56 @@ import (
 	"time"
 )
 
+// waitForFile is a hang guard, not a timing requirement for the behavior.
+func waitForFile(t *testing.T, path string) bool {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return true
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Errorf("timed out waiting for %s", path)
+	return false
+}
+
+func signalFile(t *testing.T, path string) {
+	t.Helper()
+	if err := os.WriteFile(path, nil, 0600); err != nil {
+		t.Errorf("signal %s: %v", path, err)
+	}
+}
+
 func TestBashDrainSlowCallbackPreservesBufferedTail(t *testing.T) {
 	dir := t.TempDir()
 	gate := filepath.Join(dir, "gate")
-	finished := filepath.Join(dir, "finished")
-	cmd := exec.Command("sh", "-c", `printf head; while [ ! -f "$1" ]; do sleep .01; done; printf tail; touch "$2"`, "sh", gate, finished)
+	exited := filepath.Join(dir, "exited")
+	release := filepath.Join(dir, "release")
+	defer signalFile(t, release)
+	// The descendant retains the pipe and confirms the actual parent exit (and
+	// reap), rather than merely observing a marker written before exit.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "sh", "-c", `
+		parent=$$
+		(while kill -0 "$parent" 2>/dev/null; do sleep .01; done
+		 touch "$2"; while [ ! -f "$3" ]; do sleep .01; done) &
+		printf head; while [ ! -f "$1" ]; do sleep .01; done; printf tail
+	`, "sh", gate, exited, release)
 	var output bytes.Buffer
 	first := true
 	err := runBashCommand(cmd, writerFunc(func(p []byte) (int, error) {
 		output.Write(p)
 		if first {
 			first = false
-			if err := os.WriteFile(gate, nil, 0600); err != nil {
-				t.Error(err)
+			signalFile(t, gate)
+			if waitForFile(t, exited) {
+				// Make the callback exceed the post-exit idle window while the
+				// tail is already buffered and the descendant holds the pipe.
+				time.Sleep(3 * bashExitStdioGrace)
 			}
-			deadline := time.Now().Add(3 * time.Second)
-			for {
-				if _, err := os.Stat(finished); err == nil {
-					break
-				}
-				if time.Now().After(deadline) {
-					t.Error("child did not finish")
-					break
-				}
-				time.Sleep(time.Millisecond)
-			}
-			time.Sleep(3 * bashExitStdioGrace)
+			signalFile(t, release)
 		}
 		return len(p), nil
 	}))
@@ -49,22 +73,53 @@ func TestBashDrainSlowCallbackPreservesBufferedTail(t *testing.T) {
 }
 
 func TestBashDrainDescendantIdleAndOutput(t *testing.T) {
-	for _, tc := range []struct{ name, script, want string }{
-		{"quiet", `(sleep 2) & printf done`, "done"},
-		{"active", `(sleep .06; printf a; sleep .06; printf b; sleep .06; printf c) & printf start`, "startabc"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			var out bytes.Buffer
-			start := time.Now()
-			err := runBashCommand(exec.Command("sh", "-c", tc.script), &out)
-			if err != nil || out.String() != tc.want {
+	t.Run("quiet", func(t *testing.T) {
+		release := filepath.Join(t.TempDir(), "release")
+		defer signalFile(t, release)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		done := make(chan error, 1)
+		var out bytes.Buffer
+		go func() {
+			done <- runBashCommand(exec.CommandContext(ctx, "sh", "-c", `(while [ ! -f "$1" ]; do sleep .01; done) & printf done`, "sh", release), &out)
+		}()
+		select {
+		case err := <-done:
+			if err != nil || out.String() != "done" {
 				t.Fatalf("output %q err %v", out.String(), err)
 			}
-			if time.Since(start) > time.Second {
-				t.Fatal("quiet pipe was not released")
+		case <-time.After(10 * time.Second):
+			t.Fatal("quiet pipe was not released")
+		}
+	})
+	t.Run("active", func(t *testing.T) {
+		dir := t.TempDir()
+		defer signalFile(t, filepath.Join(dir, "a"))
+		defer signalFile(t, filepath.Join(dir, "b"))
+		// Each next write waits for the preceding callback; the parent stays
+		// alive until all writes have been delivered, independent of scheduling.
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, "sh", "-c", `
+			(printf a; while [ ! -f "$1/a" ]; do sleep .01; done
+			 printf b; while [ ! -f "$1/b" ]; do sleep .01; done
+			 printf c; touch "$1/done") &
+			while [ ! -f "$1/done" ]; do sleep .01; done
+		`, "sh", dir)
+		var out bytes.Buffer
+		err := runBashCommand(cmd, writerFunc(func(p []byte) (int, error) {
+			n, err := out.Write(p)
+			for _, b := range p {
+				if b == 'a' || b == 'b' {
+					signalFile(t, filepath.Join(dir, string(b)))
+				}
 			}
-		})
-	}
+			return n, err
+		}))
+		if err != nil || out.String() != "abc" {
+			t.Fatalf("output %q err %v", out.String(), err)
+		}
+	})
 }
 
 func TestBashDrainCancellation(t *testing.T) {
