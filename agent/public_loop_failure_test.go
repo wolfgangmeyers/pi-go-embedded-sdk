@@ -169,3 +169,89 @@ func TestPublicLoopParallelFatalJoinsSibling(t *testing.T) {
 		})
 	}
 }
+
+func TestPublicLoopPrematureProviderClose(t *testing.T) {
+	for _, continuation := range []bool{false, true} {
+		for _, mode := range []string{"no-start", "partial", "malformed-done", "malformed-error", "cancel"} {
+			t.Run(fmt.Sprintf("continue=%v/%s", continuation, mode), func(t *testing.T) {
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				fn := func(context.Context, *ai.Model, ai.TranscriptContext, *ai.SimpleStreamOptions) *ai.AssistantMessageEventStream {
+					s := ai.NewAssistantMessageEventStream()
+					switch mode {
+					case "partial", "cancel":
+						s.Push(ai.AssistantMessageEvent{Type: ai.EventStart, Partial: &ai.AssistantMessage{Content: ai.ContentList{ai.TextContent{Text: "unfinished"}}}})
+						if mode == "cancel" {
+							cancel()
+						}
+						s.End()
+					case "malformed-done":
+						s.Push(ai.AssistantMessageEvent{Type: ai.EventDone})
+					case "malformed-error":
+						s.Push(ai.AssistantMessageEvent{Type: ai.EventError})
+					default:
+						s.End()
+					}
+					return s
+				}
+				prompt := ai.NewUserText("hi", 1)
+				ac := agent.AgentContext{}
+				cfg := agent.AgentLoopConfig{Model: &ai.Model{ID: "mock", Provider: "mock"}}
+				var s *ai.EventStream[agent.AgentEvent, []agent.AgentMessage]
+				if continuation {
+					ac.Messages = []agent.AgentMessage{prompt}
+					var err error
+					s, err = agent.AgentLoopContinue(ctx, ac, cfg, fn)
+					if err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					s = agent.AgentLoop(ctx, []agent.AgentMessage{prompt}, ac, cfg, fn)
+				}
+				done := make(chan []agent.AgentEvent, 1)
+				go func() {
+					var events []agent.AgentEvent
+					for e := range s.Events() {
+						events = append(events, e)
+					}
+					done <- events
+				}()
+				var events []agent.AgentEvent
+				select {
+				case events = <-done:
+				case <-time.After(3 * time.Second):
+					t.Fatal("stream blocked")
+				}
+				messages := s.Result()
+				expected := 1
+				if !continuation {
+					expected++
+				}
+				if len(messages) != expected {
+					t.Fatalf("unexpected transcript: %#v", messages)
+				}
+				failure, ok := messages[len(messages)-1].(*ai.AssistantMessage)
+				if !ok || failure == nil {
+					t.Fatalf("nil or invalid failure: %#v", messages)
+				}
+				want, text := ai.StopError, "provider stream"
+				if mode == "cancel" {
+					want, text = ai.StopAborted, "context canceled"
+				}
+				if failure.StopReason != want || !strings.Contains(failure.ErrorMessage, text) {
+					t.Fatalf("bad failure: %+v", failure)
+				}
+				if len(events) < 2 || events[len(events)-1].Type != agent.EvAgentEnd || events[len(events)-2].Type != agent.EvTurnEnd {
+					t.Fatalf("bad lifecycle: %#v", events)
+				}
+				for _, e := range events {
+					if e.Type == agent.EvMessageEnd {
+						if m, ok := e.Message.(*ai.AssistantMessage); ok && m == nil {
+							t.Fatal("typed nil message")
+						}
+					}
+				}
+			})
+		}
+	}
+}

@@ -387,18 +387,22 @@ func streamAssistantResponse(ctx context.Context, agentCtx *AgentContext, config
 	}
 
 	response := fn(ctx, config.Model, llmCtx, opts)
-	// Record the requested level, whichever stream function answered
-	// (upstream 540e174c7). Like pi's Object.assign it lands on the result
-	// itself, before any copy of it is emitted.
+	// A terminal event must carry its corresponding message. An abruptly closed
+	// stream has no terminal response even if End was supplied a result.
 	thinkingLevel := ai.ModelThinkingLevel(config.requestedThinkingLevel())
-	result := func() *ai.AssistantMessage {
-		final := response.Result()
-		// Nil only for a stream that ended with no terminal event, which pi's
-		// result() never resolves for; do not turn that into a panic here.
-		if final != nil {
-			final.ThinkingLevel = thinkingLevel
+	failure := func(reason string) *ai.AssistantMessage {
+		stop := ai.StopError
+		if aborted(ctx) {
+			stop = ai.StopAborted
+			reason = ctx.Err().Error()
 		}
-		return final
+		m := &ai.AssistantMessage{Content: ai.ContentList{ai.TextContent{Text: ""}}, Usage: emptyUsage, StopReason: stop, ErrorMessage: reason, Timestamp: nowMillis(), ThinkingLevel: thinkingLevel}
+		if config.Model != nil {
+			m.Api = ai.Api(config.Model.Api)
+			m.Provider = ai.ProviderId(config.Model.Provider)
+			m.Model = config.Model.ID
+		}
+		return m
 	}
 
 	var partial *ai.AssistantMessage
@@ -407,6 +411,9 @@ func streamAssistantResponse(ctx context.Context, agentCtx *AgentContext, config
 	for event := range response.Events() {
 		switch event.Type {
 		case ai.EventStart:
+			if event.Partial == nil {
+				continue
+			}
 			partial = event.Partial
 			agentCtx.Messages = append(agentCtx.Messages, partial)
 			addedPartial = true
@@ -415,7 +422,7 @@ func streamAssistantResponse(ctx context.Context, agentCtx *AgentContext, config
 		case ai.EventTextStart, ai.EventTextDelta, ai.EventTextEnd,
 			ai.EventThinkingStart, ai.EventThinkingDelta, ai.EventThinkingEnd,
 			ai.EventToolCallStart, ai.EventToolCallDelta, ai.EventToolCallEnd:
-			if partial != nil {
+			if partial != nil && event.Partial != nil {
 				partial = event.Partial
 				agentCtx.Messages[len(agentCtx.Messages)-1] = partial
 				ev := event
@@ -423,7 +430,15 @@ func streamAssistantResponse(ctx context.Context, agentCtx *AgentContext, config
 			}
 
 		case ai.EventDone, ai.EventError:
-			final := result()
+			final := event.Message
+			if event.Type == ai.EventError {
+				final = event.Error
+			}
+			if final == nil {
+				final = failure("provider stream returned a terminal event without a message")
+			} else {
+				final.ThinkingLevel = thinkingLevel
+			}
 			if addedPartial {
 				agentCtx.Messages[len(agentCtx.Messages)-1] = final
 			} else {
@@ -435,7 +450,7 @@ func streamAssistantResponse(ctx context.Context, agentCtx *AgentContext, config
 		}
 	}
 
-	final := result()
+	final := failure("provider stream closed before a terminal event")
 	if addedPartial {
 		agentCtx.Messages[len(agentCtx.Messages)-1] = final
 	} else {
