@@ -652,6 +652,11 @@ func executeToolCallsSequential(ctx context.Context, current *AgentContext, msg 
 // admission. Steering can skip only calls that have not yet been admitted. Once
 // admitted, a call must run even if steering or cancellation arrives later.
 func executeAdmittedCallsParallel(ctx context.Context, current *AgentContext, msg *ai.AssistantMessage, calls []ai.ToolCall, config AgentLoopConfig, emit EventSink) executedBatch {
+	return executeAdmittedCallsParallelWithPublication(ctx, current, msg, calls, config, emit, nil)
+}
+
+// onFatalPublished is an optional observation barrier for concurrency tests.
+func executeAdmittedCallsParallelWithPublication(ctx context.Context, current *AgentContext, msg *ai.AssistantMessage, calls []ai.ToolCall, config AgentLoopConfig, emit EventSink, onFatalPublished func()) executedBatch {
 	var fatalMu sync.Mutex
 	var workerPanic any
 	publishFatal := func(r any) {
@@ -660,6 +665,9 @@ func executeAdmittedCallsParallel(ctx context.Context, current *AgentContext, ms
 			workerPanic = r
 		}
 		fatalMu.Unlock()
+		if onFatalPublished != nil {
+			onFatalPublished()
+		}
 	}
 	checkFatal := func() {
 		fatalMu.Lock()
