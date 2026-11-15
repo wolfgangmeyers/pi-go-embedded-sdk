@@ -88,7 +88,8 @@ func (e *ShellTimeoutError) Error() string {
 
 // BashExecOptions are the per-command controls pi passes to BashOperations.exec.
 type BashExecOptions struct {
-	// OnData receives interleaved stdout/stderr as it is produced.
+	// OnData receives interleaved stdout/stderr synchronously. A slow or blocked
+	// callback delays completion without a time bound, including on cancellation.
 	OnData func(data []byte)
 	// TimeoutSeconds bounds the command; zero or less means no timeout.
 	TimeoutSeconds float64
@@ -142,9 +143,8 @@ func LocalBashOperations(config shellToolConfig) BashOperations {
 			// backgrounded grandchildren don't survive (port of pi).
 			setProcessGroup(cmd)
 			cmd.Cancel = func() error { return killProcessTree(cmd) }
-			// WaitDelay backstops the manual drain: if killProcessTree fires and a
-			// descendant still pins the pipe, os/exec force-closes the inherited
-			// fds shortly after Wait returns so we never hang.
+			// Bound os/exec-owned I/O (such as legacy WSL stdin) after cancellation.
+			// The manually owned output pipe has its own post-exit idle policy.
 			cmd.WaitDelay = time.Second
 
 			runErr := runBashCommand(cmd, onDataWriter(options.OnData))

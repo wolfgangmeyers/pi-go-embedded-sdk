@@ -1140,58 +1140,7 @@ func runBashCommand(cmd *exec.Cmd, w io.Writer) error {
 	// The parent must drop its write end or pr never sees EOF.
 	pw.Close()
 
-	// The reader goroutine feeds w and reports each chunk (and final EOF) on
-	// chunks. Closing pr unblocks a read parked on a pipe a descendant still
-	// holds open.
-	chunks := make(chan struct{}, 1)
-	readDone := make(chan struct{})
-	go func() {
-		defer close(readDone)
-		buf := make([]byte, 32*1024)
-		for {
-			n, rerr := pr.Read(buf)
-			if n > 0 {
-				w.Write(buf[:n])
-			}
-			select {
-			case chunks <- struct{}{}:
-			default:
-			}
-			if rerr != nil {
-				return
-			}
-		}
-	}()
-
-	waitErr := cmd.Wait()
-
-	// Process has exited. Drain any output still arriving, re-arming the idle
-	// grace per chunk; release on idle-grace OR pipe EOF (reader done).
-	timer := time.NewTimer(bashExitStdioGrace)
-	defer timer.Stop()
-drain:
-	for {
-		select {
-		case <-readDone:
-			break drain
-		case <-chunks:
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
-			timer.Reset(bashExitStdioGrace)
-		case <-timer.C:
-			break drain
-		}
-	}
-	// Stop tracking the (possibly still-open) inherited handle and unblock the
-	// reader. The reader appends only what it has already read, so output isn't
-	// double-counted.
-	pr.Close()
-	<-readDone
-	return waitErr
+	return drainBashPipe(cmd, pr, w)
 }
 
 func argFloat(params map[string]any, key string) (float64, bool) {
