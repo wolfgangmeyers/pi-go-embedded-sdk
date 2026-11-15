@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -165,5 +166,58 @@ func TestParallelPublishedFatalPreventsNextAdmission(t *testing.T) {
 	}
 	if len(admitted) != 1 || <-admitted != "one" {
 		t.Fatal("admission continued after fatal publication")
+	}
+}
+
+// Listeners and ordinary hooks share one serial callback lane, while bodies
+// must still overlap. Admission is deliberately not part of that lane.
+func TestAdmittedParallelCallbacksSerializedAndBodiesOverlap(t *testing.T) {
+	var active atomic.Int32
+	var overlap atomic.Bool
+	callback := func() {
+		if active.Add(1) != 1 {
+			overlap.Store(true)
+		}
+		time.Sleep(time.Millisecond)
+		active.Add(-1)
+	}
+	started := make(chan struct{}, 2)
+	release := make(chan struct{})
+	done := make(chan any, 1)
+	tool := AgentTool{Name: "effect", Parameters: &ai.Schema{Type: "object"}, Execute: func(_ context.Context, _ string, _ map[string]any, update ToolUpdateFunc) (AgentToolResult, error) {
+		started <- struct{}{}
+		<-release
+		update(AgentToolResult{})
+		return AgentToolResult{}, nil
+	}}
+	calls := []ai.ToolCall{{ID: "one", Name: "effect", Arguments: map[string]any{}}, {ID: "two", Name: "effect", Arguments: map[string]any{}}}
+	go func() {
+		defer func() { done <- recover() }()
+		executeAdmittedCallsParallel(context.Background(), &AgentContext{Tools: []AgentTool{tool}}, nil, calls, AgentLoopConfig{
+			BeforeToolExecute: func(context.Context, BeforeToolCallContext) error { return nil },
+			BeforeToolCall:    func(context.Context, BeforeToolCallContext) *BeforeToolCallResult { callback(); return nil },
+			AfterToolCall:     func(context.Context, AfterToolCallContext) *AfterToolCallResult { callback(); return nil },
+		}, func(AgentEvent) error { callback(); return nil })
+	}()
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
+	barrierWait(t, started, "first body")
+	barrierWait(t, started, "second body")
+	close(release)
+	select {
+	case p := <-done:
+		if p != nil {
+			t.Fatalf("panic: %v", p)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("batch did not finish")
+	}
+	if overlap.Load() {
+		t.Fatal("callbacks overlapped")
 	}
 }

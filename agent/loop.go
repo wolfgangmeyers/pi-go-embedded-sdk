@@ -655,8 +655,25 @@ func executeAdmittedCallsParallel(ctx context.Context, current *AgentContext, ms
 	return executeAdmittedCallsParallelWithPublication(ctx, current, msg, calls, config, emit, nil)
 }
 
-// onFatalPublished is an optional observation barrier for concurrency tests.
+// The optional observer lets tests coordinate on fatal publication itself.
 func executeAdmittedCallsParallelWithPublication(ctx context.Context, current *AgentContext, msg *ai.AssistantMessage, calls []ai.ToolCall, config AgentLoopConfig, emit EventSink, onFatalPublished func()) executedBatch {
+	// Callback serialization must not cover admission or replay: either may wait
+	// for a sibling's update or finalization.
+	var serialMu sync.Mutex
+	safeEmit := func(e AgentEvent) error {
+		serialMu.Lock()
+		defer serialMu.Unlock()
+		return emit(e)
+	}
+	hooks := config.toolCallHooks()
+	if before := hooks.BeforeToolCall; before != nil {
+		hooks.BeforeToolCall = func(ctx context.Context, c BeforeToolCallContext) *BeforeToolCallResult {
+			serialMu.Lock()
+			defer serialMu.Unlock()
+			return before(ctx, c)
+		}
+	}
+
 	var fatalMu sync.Mutex
 	var workerPanic any
 	publishFatal := func(r any) {
@@ -677,6 +694,7 @@ func executeAdmittedCallsParallelWithPublication(ctx context.Context, current *A
 			panic(parallelWorkerAbort{cause: r})
 		}
 	}
+	hooks.checkFatal = checkFatal
 	var wg sync.WaitGroup
 	// An admission hook or listener may panic while earlier calls are running.
 	// Admitted workers must settle before any failure escapes.
@@ -696,12 +714,13 @@ func executeAdmittedCallsParallelWithPublication(ctx context.Context, current *A
 		checkFatal()
 		interrupted := config.HasSteeringMessages != nil && config.HasSteeringMessages()
 		checkFatal()
-		mustEmit(emit, AgentEvent{Type: EvToolExecutionStart, ToolCallID: tc.ID, ToolName: tc.Name, Args: tc.Arguments})
+		mustEmit(safeEmit, AgentEvent{Type: EvToolExecutionStart, ToolCallID: tc.ID, ToolName: tc.Name, Args: tc.Arguments})
 		checkFatal()
 		var prep prepareResult
 		if !interrupted {
-			hooks := config.toolCallHooks()
-			hooks.checkFatal = checkFatal
+			// This check is the admission reservation: it is ordered with fatal
+			// publication under fatalMu. Once reserved, the hook and replay run
+			// without that lock and a later fatal cannot revoke the reservation.
 			prep = prepareToolCall(ctx, current, msg, tc, hooks, current.Tools)
 		}
 		count++
@@ -717,7 +736,7 @@ func executeAdmittedCallsParallelWithPublication(ctx context.Context, current *A
 				fo = replayOutcome(tc, prep.replay)
 			}
 			outcomes[i] = fo
-			emitToolExecutionEnd(fo, emit)
+			emitToolExecutionEnd(fo, safeEmit)
 			if aborted(ctx) && !interrupted {
 				break
 			}
@@ -733,10 +752,14 @@ func executeAdmittedCallsParallelWithPublication(ctx context.Context, current *A
 					publishFatal(r)
 				}
 			}()
-			executed := executePreparedToolCall(ctx, prepared, emitToolExecutionUpdate(prepared.toolCall, emit))
-			fo := finalizeExecutedToolCall(ctx, current, msg, prepared, executed, config.toolCallHooks())
-			outcomes[i] = fo
-			emitToolExecutionEnd(fo, emit)
+			executed := executePreparedToolCall(ctx, prepared, emitToolExecutionUpdate(prepared.toolCall, safeEmit))
+			func() {
+				serialMu.Lock()
+				defer serialMu.Unlock()
+				fo := finalizeExecutedToolCall(ctx, current, msg, prepared, executed, hooks)
+				outcomes[i] = fo
+				emitToolExecutionEnd(fo, emit)
+			}()
 		}(i)
 	}
 	wg.Wait()
@@ -744,7 +767,7 @@ func executeAdmittedCallsParallelWithPublication(ctx context.Context, current *A
 	var messages []ai.ToolResultMessage
 	for _, fo := range outcomes[:count] {
 		trm := createToolResultMessage(fo)
-		emitToolResultMessage(trm, emit)
+		emitToolResultMessage(trm, safeEmit)
 		messages = append(messages, trm)
 	}
 	return executedBatch{messages: messages, terminate: shouldTerminateBatch(outcomes[:count])}
