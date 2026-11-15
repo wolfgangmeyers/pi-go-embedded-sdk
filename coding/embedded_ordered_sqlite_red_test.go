@@ -248,6 +248,9 @@ func TestEmbeddedOrderedWriteFailureStopsBeforeProviderAndDoesNotClaimSuccess(t 
 	if called || len(roles(t, h)) != 0 {
 		t.Fatal("provider ran after failed first commit")
 	}
+	if len(s.History()) != 0 {
+		t.Fatalf("uncommitted synthetic failure in live history: %v", s.History())
+	}
 	h.failAppend = false
 	if _, err := h.db.Exec(`PRAGMA query_only=ON`); err != nil {
 		t.Fatal(err)

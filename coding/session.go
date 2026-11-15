@@ -609,6 +609,13 @@ func (s *Session) installTransformContext() {
 		}
 		if compact := s.compactTransform; compact != nil {
 			transformed = compact(ctx, transformed)
+		} else if state := s.compactState; state != nil {
+			state.mu.Lock()
+			checkpoint := state.checkpoint
+			state.mu.Unlock()
+			if checkpoint != nil {
+				transformed = checkpoint.apply(transformed)
+			}
 		}
 		return s.projectForcedPrompt(ctx, transformed)
 	}
@@ -877,12 +884,16 @@ func (s *Session) RunMessages(ctx context.Context, prompts []agent.AgentMessage)
 	}
 
 	result := &RunResult{}
+	var failureStop ai.StopReason
 	unsub := s.Agent.Subscribe(func(ctx context.Context, e agent.AgentEvent) error {
 		if e.Type != agent.EvMessageEnd {
 			return nil
 		}
 		if am, ok := messageAsAssistant(e.Message); ok {
 			addUsage(&result.Usage, am.Usage)
+			if am.ErrorMessage != "" {
+				failureStop = am.StopReason
+			}
 		}
 		return nil
 	})
@@ -909,6 +920,9 @@ func (s *Session) RunMessages(ctx context.Context, prompts []agent.AgentMessage)
 	result.Text = s.LastAssistantText()
 	result.ErrorMessage = st.ErrorMessage
 	if result.ErrorMessage != "" {
+		if failureStop != "" {
+			result.StopReason = failureStop
+		}
 		return result, fmt.Errorf("%s", result.ErrorMessage)
 	}
 	return result, nil

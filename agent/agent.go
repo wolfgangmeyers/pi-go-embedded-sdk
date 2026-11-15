@@ -727,7 +727,9 @@ func (a *Agent) eventSink(ctx context.Context, checked bool) EventSink {
 			a.state.StreamingMessage = event.Message
 		case EvMessageEnd:
 			a.state.StreamingMessage = nil
-			a.state.Messages = append(a.state.Messages, event.Message)
+			if checked || a.BeforeMessageEnd == nil {
+				a.state.Messages = append(a.state.Messages, event.Message)
+			}
 		case EvToolExecutionStart:
 			// Copy-on-write (pi agent.ts:524-529, `new Set(...)`): State()'s
 			// shallow copy hands out an immutable snapshot, never the live map.

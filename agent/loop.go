@@ -573,7 +573,10 @@ func executeToolCalls(ctx context.Context, current *AgentContext, msg *ai.Assist
 			break
 		}
 	}
-	if config.ToolExecution == ToolSequential || hasSequential {
+	// Durable admissions must be followed by execution before another call can
+	// be admitted or steering can skip it; deferred parallel preparation cannot
+	// uphold that contract. Non-admission batches remain parallel.
+	if config.ToolExecution == ToolSequential || hasSequential || config.BeforeToolExecute != nil {
 		return executeToolCallsSequential(ctx, current, msg, toolCalls, config, emit)
 	}
 	return executeToolCallsParallel(ctx, current, msg, toolCalls, config, emit)
@@ -1075,6 +1078,9 @@ func executePreparedToolCall(ctx context.Context, prepared preparedToolCall, onU
 				if ep, ok := r.(emitPanic); ok {
 					panic(ep)
 				}
+				if abort, ok := r.(toolAdmissionAbort); ok {
+					panic(abort)
+				}
 				out = immediateOutcome{result: errorToolResult(panicMessage(r)), isError: true}
 			}
 		}()
@@ -1115,6 +1121,9 @@ func finalizeExecutedToolCall(ctx context.Context, current *AgentContext, msg *a
 				if r := recover(); r != nil {
 					if ep, ok := r.(emitPanic); ok {
 						panic(ep)
+					}
+					if abort, ok := r.(toolAdmissionAbort); ok {
+						panic(abort)
 					}
 					result = errorToolResult(panicMessage(r))
 					isError = true
