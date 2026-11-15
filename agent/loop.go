@@ -32,6 +32,16 @@ func streamSimpleTranscript(ctx context.Context, model *ai.Model, req ai.Transcr
 // recovered at the run boundary (in agent.go) or in the low-level goroutine.
 type emitPanic struct{ err error }
 
+// toolAdmissionAbort is distinct from a permission denial or tool error. It
+// unwinds to Agent's failure boundary without publishing a tool result.
+type toolAdmissionAbort struct{ err error }
+
+// PolicyDenial is a host policy rejection before durable effect intent. Only
+// BeforeToolExecute may return it; all other admission failures remain fatal.
+type PolicyDenial struct{ Reason string }
+
+func (d *PolicyDenial) Error() string { return d.Reason }
+
 // mustEmit emits an event and unwinds the loop (via panic) if the sink returns
 // an error, matching pi's "await emit(...)" throwing on a rejected listener.
 func mustEmit(emit EventSink, e AgentEvent) {
@@ -319,6 +329,7 @@ func streamAssistantResponse(ctx context.Context, agentCtx *AgentContext, config
 		StreamOptions: ai.StreamOptions{
 			ProviderRequestOptions: ai.ProviderRequestOptions{
 				APIKey:          apiKey,
+				CodexAuth:       config.CodexAuth,
 				OnPayload:       config.OnPayload,
 				OnResponse:      config.OnResponse,
 				MaxRetryDelayMs: config.MaxRetryDelayMs,
@@ -528,6 +539,17 @@ func failToolCallsFromTruncatedMessage(toolCalls []ai.ToolCall, emit EventSink) 
 	return executedBatch{messages: messages, terminate: false}
 }
 
+func interruptedToolOutcome(tc ai.ToolCall) AgentToolCallOutcome {
+	return AgentToolCallOutcome{
+		ToolCall: tc,
+		Result: errorToolResult(fmt.Sprintf(
+			`Tool call "%s" was not executed: interrupted by user steering message.`,
+			tc.Name,
+		)),
+		IsError: true,
+	}
+}
+
 func executeToolCalls(ctx context.Context, current *AgentContext, msg *ai.AssistantMessage, config AgentLoopConfig, emit EventSink) executedBatch {
 	toolCalls := filterToolCalls(msg)
 	if config.HasSteeringMessages != nil && config.HasSteeringMessages() {
@@ -535,14 +557,7 @@ func executeToolCalls(ctx context.Context, current *AgentContext, msg *ai.Assist
 		var messages []ai.ToolResultMessage
 		for _, tc := range toolCalls {
 			mustEmit(emit, AgentEvent{Type: EvToolExecutionStart, ToolCallID: tc.ID, ToolName: tc.Name, Args: tc.Arguments})
-			fo := AgentToolCallOutcome{
-				ToolCall: tc,
-				Result: errorToolResult(fmt.Sprintf(
-					`Tool call "%s" was not executed: interrupted by user steering message.`,
-					tc.Name,
-				)),
-				IsError: true,
-			}
+			fo := interruptedToolOutcome(tc)
 			emitToolExecutionEnd(fo, emit)
 			trm := createToolResultMessage(fo)
 			emitToolResultMessage(trm, emit)
@@ -591,14 +606,7 @@ func executeToolCallsSequential(ctx context.Context, current *AgentContext, msg 
 		if hasSteering() {
 			for _, remaining := range toolCalls[i:] {
 				mustEmit(emit, AgentEvent{Type: EvToolExecutionStart, ToolCallID: remaining.ID, ToolName: remaining.Name, Args: remaining.Arguments})
-				fo := AgentToolCallOutcome{
-					ToolCall: remaining,
-					Result: errorToolResult(fmt.Sprintf(
-						`Tool call "%s" was not executed: interrupted by user steering message.`,
-						remaining.Name,
-					)),
-					IsError: true,
-				}
+				fo := interruptedToolOutcome(remaining)
 				emitToolExecutionEnd(fo, emit)
 				trm := createToolResultMessage(fo)
 				emitToolResultMessage(trm, emit)
@@ -614,6 +622,8 @@ func executeToolCallsSequential(ctx context.Context, current *AgentContext, msg 
 		var fo AgentToolCallOutcome
 		if prep.immediate != nil {
 			fo = AgentToolCallOutcome{ToolCall: tc, Result: prep.immediate.result, IsError: prep.immediate.isError}
+		} else if prep.replay != nil {
+			fo = replayOutcome(tc, prep.replay)
 		} else {
 			executed := executePreparedToolCall(ctx, *prep.prepared, emitToolExecutionUpdate(prep.prepared.toolCall, emit))
 			fo = finalizeExecutedToolCall(ctx, current, msg, *prep.prepared, executed, config.toolCallHooks())
@@ -670,6 +680,12 @@ func executeToolCallsParallel(ctx context.Context, current *AgentContext, msg *a
 			}
 			continue
 		}
+		if prep.replay != nil {
+			fo := replayOutcome(tc, prep.replay)
+			emitToolExecutionEnd(fo, safeEmit)
+			slots = append(slots, slot{immediate: &fo})
+			continue
+		}
 		prepared := *prep.prepared
 		slots = append(slots, slot{toolCall: prepared.toolCall, thunk: func() AgentToolCallOutcome {
 			// Tool execution runs in parallel, OUTSIDE the lock (pi's Promise.all).
@@ -723,6 +739,13 @@ func executeToolCallsParallel(ctx context.Context, current *AgentContext, msg *a
 	// finalize, so AfterToolCall never runs for it; deciding here also keeps those
 	// end events in slot order, as pi's synchronous map does.
 	batchAborted := aborted(ctx)
+	hasSteering := func() bool {
+		if config.HasSteeringMessages != nil {
+			return config.HasSteeringMessages()
+		}
+		return false
+	}
+
 	for i, s := range slots {
 		if s.immediate != nil {
 			ordered[i] = *s.immediate
@@ -745,16 +768,35 @@ func executeToolCallsParallel(ctx context.Context, current *AgentContext, msg *a
 			ordered[i] = fo
 			continue
 		}
+		if hasSteering() {
+			fo := interruptedToolOutcome(s.toolCall)
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						panicOnce.Do(func() { panicVal = r })
+					}
+				}()
+				emitToolExecutionEnd(fo, safeEmit)
+			}()
+			ordered[i] = fo
+			continue
+		}
 		wg.Add(1)
-		go func(i int, thunk func() AgentToolCallOutcome) {
+		go func(i int, s slot) {
 			defer wg.Done()
 			defer func() {
 				if r := recover(); r != nil {
 					panicOnce.Do(func() { panicVal = r })
 				}
 			}()
-			ordered[i] = thunk()
-		}(i, s.thunk)
+			if hasSteering() {
+				fo := interruptedToolOutcome(s.toolCall)
+				emitToolExecutionEnd(fo, safeEmit)
+				ordered[i] = fo
+				return
+			}
+			ordered[i] = s.thunk()
+		}(i, s)
 	}
 	wg.Wait()
 	// Re-raise any listener-error/panic from a tool goroutine on the loop
@@ -787,6 +829,7 @@ type preparedToolCall struct {
 type prepareResult struct {
 	immediate *immediateOutcome
 	prepared  *preparedToolCall
+	replay    *ai.ToolResultMessage
 }
 
 // prepareToolCall resolves tc against tools — the context's tools for a
@@ -795,7 +838,7 @@ type prepareResult struct {
 func prepareToolCall(ctx context.Context, current *AgentContext, msg *ai.AssistantMessage, tc ai.ToolCall, hooks ToolCallHooks, tools []AgentTool) (res prepareResult) {
 	tool, ok := findTool(tools, tc.Name)
 	if !ok {
-		return prepareResult{immediate: &immediateOutcome{result: errorToolResult("Tool " + tc.Name + " not found"), isError: true}}
+		return prepareResult{immediate: &immediateOutcome{result: errorToolResult("Tool unavailable"), isError: true}}
 	}
 
 	// pi wraps prepareArguments/validate/beforeToolCall in try/catch; a throw
@@ -805,6 +848,9 @@ func prepareToolCall(ctx context.Context, current *AgentContext, msg *ai.Assista
 		if r := recover(); r != nil {
 			if ep, ok := r.(emitPanic); ok {
 				panic(ep)
+			}
+			if abort, ok := r.(toolAdmissionAbort); ok {
+				panic(abort)
 			}
 			res = prepareResult{immediate: &immediateOutcome{result: errorToolResult(panicMessage(r)), isError: true}}
 		}
@@ -819,7 +865,13 @@ func prepareToolCall(ctx context.Context, current *AgentContext, msg *ai.Assista
 
 	validated, err := ai.ValidateToolArguments(tool.asAITool(), prepared)
 	if err != nil {
-		return prepareResult{immediate: &immediateOutcome{result: errorToolResult(err.Error()), isError: true}}
+		message := err.Error()
+		if tool.ValidationError != nil {
+			if diagnostic := tool.ValidationError(prepared.Arguments); diagnostic != "" {
+				message = diagnostic
+			}
+		}
+		return prepareResult{immediate: &immediateOutcome{result: errorToolResult(message), isError: true}}
 	}
 
 	if hooks.BeforeToolCall != nil {
@@ -849,6 +901,44 @@ func prepareToolCall(ctx context.Context, current *AgentContext, msg *ai.Assista
 	if aborted(ctx) {
 		return prepareResult{immediate: &immediateOutcome{result: errorToolResult("Operation aborted"), isError: true}}
 	}
+	if hooks.BeforeToolExecute != nil {
+		// Keep admission outside tool Execute's error-to-result conversion.
+		// Only a typed pre-intent policy denial may continue as a checked result.
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					if abort, ok := r.(toolAdmissionAbort); ok {
+						panic(abort)
+					}
+					panic(toolAdmissionAbort{err: fmt.Errorf("intent admission panicked: %s", panicMessage(r))})
+				}
+			}()
+			if err := hooks.BeforeToolExecute(ctx, BeforeToolCallContext{AssistantMessage: msg, ToolCall: prepared, Args: validated, Context: current}); err != nil {
+				var denial *PolicyDenial
+				if errors.As(err, &denial) && denial != nil && !aborted(ctx) {
+					res = prepareResult{immediate: &immediateOutcome{result: errorToolResult(denial.Error()), isError: true}}
+					return
+				}
+				panic(toolAdmissionAbort{err: err})
+			}
+		}()
+		if res.immediate != nil {
+			return res
+		}
+	}
+	if hooks.ReplayToolResult != nil && !aborted(ctx) {
+		// Only an admitted, schema-valid call may request a saved complete result.
+		replay, err := hooks.ReplayToolResult(ctx, BeforeToolCallContext{AssistantMessage: msg, ToolCall: prepared, Args: validated, Context: current})
+		if err != nil {
+			panic(toolAdmissionAbort{err: err})
+		}
+		if replay != nil {
+			if replay.MessageRole() != ai.RoleToolResult || replay.ToolCallID == "" || replay.ToolCallID != tc.ID || replay.ToolName != tc.Name || replay.Content == nil || replay.Timestamp <= 0 {
+				panic(toolAdmissionAbort{err: errors.New("invalid saved tool result for admitted call")})
+			}
+			return prepareResult{replay: replay}
+		}
+	}
 	return prepareResult{prepared: &preparedToolCall{toolCall: tc, tool: tool, args: validated}}
 }
 
@@ -856,8 +946,10 @@ func prepareToolCall(ctx context.Context, current *AgentContext, msg *ai.Assista
 // AgentLoopConfig (pi's Pick<AgentLoopConfig, "beforeToolCall" |
 // "afterToolCall">, upstream 8562bcf66).
 type ToolCallHooks struct {
-	BeforeToolCall BeforeToolCallFunc
-	AfterToolCall  AfterToolCallFunc
+	BeforeToolExecute func(context.Context, BeforeToolCallContext) error
+	ReplayToolResult  func(context.Context, BeforeToolCallContext) (*ai.ToolResultMessage, error)
+	BeforeToolCall    BeforeToolCallFunc
+	AfterToolCall     AfterToolCallFunc
 }
 
 // requestedThinkingLevel is the pi thinking level a request asks for: pi's
@@ -870,7 +962,7 @@ func (c AgentLoopConfig) requestedThinkingLevel() ThinkingLevel {
 }
 
 func (c AgentLoopConfig) toolCallHooks() ToolCallHooks {
-	return ToolCallHooks{BeforeToolCall: c.BeforeToolCall, AfterToolCall: c.AfterToolCall}
+	return ToolCallHooks{BeforeToolCall: c.BeforeToolCall, AfterToolCall: c.AfterToolCall, BeforeToolExecute: c.BeforeToolExecute, ReplayToolResult: c.ReplayToolResult}
 }
 
 // toolUpdateSink receives a running tool's partial results. An error it
@@ -922,7 +1014,13 @@ type RunToolCallOptions struct {
 // with the loop is the job of their runner (pi's NestedToolCallRunner, Scope
 // queue row 20), which has no Go counterpart yet.
 func RunToolCall(ctx context.Context, toolCall ai.ToolCall, opts RunToolCallOptions) AgentToolCallOutcome {
+	if _, ok := findTool(opts.Tools, toolCall.Name); !ok {
+		return AgentToolCallOutcome{ToolCall: toolCall, Result: errorToolResult("Tool " + toolCall.Name + " not found"), IsError: true}
+	}
 	prep := prepareToolCall(ctx, opts.Context, opts.AssistantMessage, toolCall, opts.ToolCallHooks, opts.Tools)
+	if prep.replay != nil {
+		return replayOutcome(toolCall, prep.replay)
+	}
 	if prep.immediate != nil {
 		return AgentToolCallOutcome{ToolCall: toolCall, Result: prep.immediate.result, IsError: prep.immediate.isError}
 	}
@@ -1078,7 +1176,14 @@ func emitToolExecutionEnd(fo AgentToolCallOutcome, emit EventSink) {
 	})
 }
 
+func replayOutcome(tc ai.ToolCall, replay *ai.ToolResultMessage) AgentToolCallOutcome {
+	return AgentToolCallOutcome{ToolCall: tc, Result: AgentToolResult{Content: replay.Content, Details: replay.Details, Usage: replay.Usage}, IsError: replay.IsError, replay: replay}
+}
+
 func createToolResultMessage(fo AgentToolCallOutcome) ai.ToolResultMessage {
+	if fo.replay != nil {
+		return *fo.replay
+	}
 	return ai.ToolResultMessage{
 		ToolCallID: fo.ToolCall.ID,
 		ToolName:   fo.ToolCall.Name,

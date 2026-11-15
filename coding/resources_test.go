@@ -79,6 +79,7 @@ func TestContextFileCandidateDirectoriesIgnored(t *testing.T) {
 }
 
 func TestLoadSkillsAndFormat(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	cwd := t.TempDir()
 	skillDir := filepath.Join(cwd, ".pi", "skills", "my-skill")
 	os.MkdirAll(skillDir, 0o755)

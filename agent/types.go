@@ -87,6 +87,7 @@ type AgentToolResult struct {
 // for a model-issued call, and what RunToolCall returns for a call made from
 // inside another tool.
 type AgentToolCallOutcome struct {
+	replay   *ai.ToolResultMessage
 	ToolCall ai.ToolCall
 	Result   AgentToolResult
 	// IsError is the final verdict, after AfterToolCall — the one the tool
@@ -115,6 +116,9 @@ type AgentTool struct {
 	// PrepareArguments is an optional shim applied to raw arguments before schema
 	// validation. Return the same map to indicate no change.
 	PrepareArguments func(raw map[string]any) map[string]any
+	// ValidationError optionally formats a schema rejection. The host owns safety of
+	// the returned text; arguments are untrusted. An empty result uses the safe default.
+	ValidationError func(args map[string]any) string
 	// PromptGuidelines are optional bullet lines the system prompt builder folds
 	// into its rules section (port of pi's tool promptGuidelines).
 	PromptGuidelines []string
@@ -334,6 +338,7 @@ type AgentLoopConfig struct {
 	Headers                   ai.ProviderHeaders
 	Metadata                  map[string]any
 	APIKey                    string
+	CodexAuth                 func(context.Context) (ai.ModelAuth, error)
 	OnPayload                 func(payload any, model *ai.Model) (any, error)
 	OnResponse                func(resp ai.ProviderResponse, model *ai.Model) error
 	// OnProviderStreamEvent is forwarded to the stream options as
@@ -353,8 +358,10 @@ type AgentLoopConfig struct {
 	// GetApiKey resolves an API key per call (for expiring OAuth tokens).
 	GetApiKey func(provider string) string
 
-	BeforeToolCall BeforeToolCallFunc
-	AfterToolCall  AfterToolCallFunc
+	BeforeToolCall    BeforeToolCallFunc
+	AfterToolCall     AfterToolCallFunc
+	BeforeToolExecute func(ctx context.Context, c BeforeToolCallContext) error
+	ReplayToolResult  func(ctx context.Context, c BeforeToolCallContext) (*ai.ToolResultMessage, error)
 	// FinishTurn is called after the assistant message and all tool-result
 	// messages have been emitted, immediately before turn_end. TurnEnd ends the
 	// run without polling the queues or preparing another request. On a normal

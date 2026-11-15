@@ -74,6 +74,7 @@ type AgentOptions struct {
 	TransformContext func(ctx context.Context, messages []AgentMessage) []AgentMessage
 	StreamFn         StreamFn
 	GetApiKey        func(provider string) string
+	CodexAuth        func(context.Context) (ai.ModelAuth, error)
 	OnPayload        func(payload any, model *ai.Model) (any, error)
 	OnResponse       func(resp ai.ProviderResponse, model *ai.Model) error
 
@@ -82,19 +83,21 @@ type AgentOptions struct {
 	// to the stream options. See ai.StreamOptions.OnProviderStreamEvent.
 	OnProviderStreamEvent func(data any, model *ai.Model) error
 
-	BeforeToolCall  BeforeToolCallFunc
-	AfterToolCall   AfterToolCallFunc
-	FinishTurn      FinishTurnFunc
-	PrepareRequest  PrepareRequestFunc
-	PrepareNextTurn func(c AgentTurnContext) *AgentLoopTurnUpdate
-	SteeringMode    QueueMode
-	FollowUpMode    QueueMode
-	SessionID       string
-	ThinkingBudgets *ai.ThinkingBudgets
-	Transport       ai.Transport
-	MaxRetryDelayMs *int
-	MaxRetries      int
-	TimeoutMs       int
+	BeforeToolCall    BeforeToolCallFunc
+	BeforeToolExecute func(ctx context.Context, c BeforeToolCallContext) error
+	ReplayToolResult  func(ctx context.Context, c BeforeToolCallContext) (*ai.ToolResultMessage, error)
+	AfterToolCall     AfterToolCallFunc
+	FinishTurn        FinishTurnFunc
+	PrepareRequest    PrepareRequestFunc
+	PrepareNextTurn   func(c AgentTurnContext) *AgentLoopTurnUpdate
+	SteeringMode      QueueMode
+	FollowUpMode      QueueMode
+	SessionID         string
+	ThinkingBudgets   *ai.ThinkingBudgets
+	Transport         ai.Transport
+	MaxRetryDelayMs   *int
+	MaxRetries        int
+	TimeoutMs         int
 	// WebSocketConnectTimeoutMs and HTTPClient are forwarded to the stream
 	// options (pi AgentLoopConfig extends SimpleStreamOptions).
 	WebSocketConnectTimeoutMs int
@@ -118,9 +121,11 @@ type activeRun struct {
 // transcript, emits lifecycle events, executes tools, and exposes steering/
 // follow-up queueing.
 type Agent struct {
-	mu        sync.Mutex
-	state     AgentState
-	listeners []Listener
+	// BeforeMessageEnd checks persistence before transcript publication. Do not reenter the agent.
+	BeforeMessageEnd func(context.Context, AgentMessage) error
+	mu               sync.Mutex
+	state            AgentState
+	listeners        []Listener
 
 	steeringQueue             pendingQueue
 	steeringCounter           uint64
@@ -131,6 +136,7 @@ type Agent struct {
 	TransformContext func(ctx context.Context, messages []AgentMessage) []AgentMessage
 	StreamFn         StreamFn
 	GetApiKey        func(provider string) string
+	CodexAuth        func(context.Context) (ai.ModelAuth, error)
 	OnPayload        func(payload any, model *ai.Model) (any, error)
 	OnResponse       func(resp ai.ProviderResponse, model *ai.Model) error
 
@@ -138,11 +144,13 @@ type Agent struct {
 	// Agent.onProviderStreamEvent).
 	OnProviderStreamEvent func(data any, model *ai.Model) error
 
-	BeforeToolCall  BeforeToolCallFunc
-	AfterToolCall   AfterToolCallFunc
-	FinishTurn      FinishTurnFunc
-	PrepareRequest  PrepareRequestFunc
-	PrepareNextTurn func(c AgentTurnContext) *AgentLoopTurnUpdate
+	BeforeToolCall    BeforeToolCallFunc
+	BeforeToolExecute func(ctx context.Context, c BeforeToolCallContext) error
+	ReplayToolResult  func(ctx context.Context, c BeforeToolCallContext) (*ai.ToolResultMessage, error)
+	AfterToolCall     AfterToolCallFunc
+	FinishTurn        FinishTurnFunc
+	PrepareRequest    PrepareRequestFunc
+	PrepareNextTurn   func(c AgentTurnContext) *AgentLoopTurnUpdate
 
 	SessionID                 string
 	ThinkingBudgets           *ai.ThinkingBudgets
@@ -197,10 +205,13 @@ func NewAgent(opts AgentOptions) *Agent {
 		TransformContext:          opts.TransformContext,
 		StreamFn:                  opts.StreamFn,
 		GetApiKey:                 opts.GetApiKey,
+		CodexAuth:                 opts.CodexAuth,
 		OnPayload:                 opts.OnPayload,
 		OnResponse:                opts.OnResponse,
 		OnProviderStreamEvent:     opts.OnProviderStreamEvent,
 		BeforeToolCall:            opts.BeforeToolCall,
+		BeforeToolExecute:         opts.BeforeToolExecute,
+		ReplayToolResult:          opts.ReplayToolResult,
 		AfterToolCall:             opts.AfterToolCall,
 		FinishTurn:                opts.FinishTurn,
 		PrepareRequest:            opts.PrepareRequest,
@@ -232,7 +243,7 @@ func NewAgent(opts AgentOptions) *Agent {
 	if a.ToolExecution == "" {
 		a.ToolExecution = ToolParallel
 	}
-	a.steeringQueue.mode = orMode(opts.SteeringMode, QueueOneAtATime)
+	a.steeringQueue.mode = orMode(opts.SteeringMode, QueueAll)
 	a.followUpQueue.mode = orMode(opts.FollowUpMode, QueueOneAtATime)
 	return a
 }
@@ -332,6 +343,14 @@ func (a *Agent) HasQueuedMessages() bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.steeringQueue.hasItems() || a.followUpQueue.hasItems()
+}
+
+// HasSteeringMessages reports whether any steering messages are currently queued
+// to be injected after the current assistant turn.
+func (a *Agent) HasSteeringMessages() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.steeringQueue.hasItems()
 }
 
 // PeekQueuedMessages previews the messages selected for the next turn without
@@ -509,7 +528,8 @@ func (a *Agent) handleRunFailure(ctx context.Context, msg string, aborted bool) 
 		ErrorMessage: msg,
 		Timestamp:    nowMillis(),
 	}
-	emit := a.processEvent(ctx)
+	// A rejected append must not be retried as a synthetic failure message.
+	emit := a.eventSink(ctx, false)
 	for _, e := range []AgentEvent{
 		{Type: EvMessageStart, Message: failure},
 		{Type: EvMessageEnd, Message: failure},
@@ -563,7 +583,10 @@ func (a *Agent) loopConfig(skipInitialSteeringPoll bool) AgentLoopConfig {
 		ConvertToLlm:              a.ConvertToLlm,
 		TransformContext:          a.TransformContext,
 		GetApiKey:                 a.GetApiKey,
+		CodexAuth:                 a.CodexAuth,
 		BeforeToolCall:            a.BeforeToolCall,
+		BeforeToolExecute:         a.BeforeToolExecute,
+		ReplayToolResult:          a.ReplayToolResult,
 		AfterToolCall:             a.AfterToolCall,
 		FinishTurn:                a.FinishTurn,
 		PrepareRequest:            a.PrepareRequest,
@@ -667,6 +690,8 @@ func (a *Agent) executeClaimedRun(run *activeRun, executor func(ctx context.Cont
 				var msg string
 				if ep, ok := r.(emitPanic); ok {
 					msg = ep.err.Error()
+				} else if abort, ok := r.(toolAdmissionAbort); ok {
+					msg = abort.err.Error()
 				} else {
 					msg = panicMessage(r)
 				}
@@ -688,8 +713,14 @@ func (a *Agent) executeClaimedRun(run *activeRun, executor func(ctx context.Cont
 }
 
 // processEvent reduces internal state for a loop event, then notifies listeners.
-func (a *Agent) processEvent(ctx context.Context) EventSink {
+func (a *Agent) processEvent(ctx context.Context) EventSink { return a.eventSink(ctx, true) }
+func (a *Agent) eventSink(ctx context.Context, checked bool) EventSink {
 	return func(event AgentEvent) error {
+		if checked && event.Type == EvMessageEnd && a.BeforeMessageEnd != nil {
+			if err := a.BeforeMessageEnd(ctx, event.Message); err != nil {
+				return err
+			}
+		}
 		a.mu.Lock()
 		switch event.Type {
 		case EvMessageStart, EvMessageUpdate:

@@ -483,7 +483,15 @@ func (s *Session) EnableCompaction(settings CompactionSettings) {
 	state.settings = settings
 	state.mu.Unlock()
 	s.compactTransform = func(ctx context.Context, messages []agent.AgentMessage) []agent.AgentMessage {
-		return s.compact(ctx, state, messages)
+		view, _, err := s.compactChecked(ctx, state, messages, false)
+		if err != nil && s.ordered != nil {
+			// The transform cannot return an error. Do not continue an ordered
+			// request past a failed checkpoint fence.
+			panic(err)
+		}
+		// Ordinary automatic compaction is best-effort: a failed summary
+		// keeps the current (possibly already compacted) view.
+		return view
 	}
 }
 
@@ -640,6 +648,28 @@ func (c *compactionCheckpoint) apply(messages []agent.AgentMessage) []agent.Agen
 // and re-compactions. Replacing the transcript replaces the checkpoint
 // (setCompaction).
 func (s *Session) compact(ctx context.Context, state *compactionState, messages []agent.AgentMessage) []agent.AgentMessage {
+	view, _, _ := s.compactChecked(ctx, state, messages, false)
+	return view
+}
+
+func (s *Session) Compact(ctx context.Context) (bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if s.Agent.State().IsStreaming {
+		return false, fmt.Errorf("cannot compact during run")
+	}
+	if s.compactState == nil {
+		s.EnableCompaction(DefaultCompactionSettings)
+	}
+	_, committed, err := s.compactChecked(ctx, s.compactState, s.History(), true)
+	return committed, err
+}
+
+func (s *Session) compactChecked(ctx context.Context, state *compactionState, messages []agent.AgentMessage, force bool) ([]agent.AgentMessage, bool, error) {
 	window := 0
 	if s.Model != nil {
 		window = s.Model.ContextWindow
@@ -670,18 +700,18 @@ func (s *Session) compact(ctx context.Context, state *compactionState, messages 
 		// view's tail.
 		tokens = estimateProjectedContextTokens(current, len(current)-max(len(messages)-usageFrom, 0))
 	}
-	if !shouldCompact(tokens, window, settings) {
-		return current
+	if !force && !shouldCompact(tokens, window, settings) {
+		return current, false, nil
 	}
 	// pi's prepareCompaction finds nothing to compact when the branch's last
 	// entry is the compaction itself.
 	if previous != nil && len(messages) <= previous.compactedLen {
-		return current
+		return current, false, nil
 	}
 
 	preparation, ok := prepareCompaction(messages, boundaryStart, settings.KeepRecentTokens)
 	if !ok {
-		return current // nothing new safely summarizable
+		return current, false, nil // nothing new safely summarizable
 	}
 	history, turnPrefix := preparation.messagesToSummarize, preparation.turnPrefixMessages
 
@@ -700,19 +730,19 @@ func (s *Session) compact(ctx context.Context, state *compactionState, messages 
 		if len(history) > 0 {
 			hr, ok := s.generateSummary(ctx, history, settings.ReserveTokens, previousSummary, settings.SessionID)
 			if !ok {
-				return current // summarization failed; keep current view
+				return current, false, fmt.Errorf("compaction summarization failed")
 			}
 			historyResult = hr
 		}
 		tp, ok := s.generateTurnPrefixSummary(ctx, turnPrefix, settings.ReserveTokens, settings.SessionID)
 		if !ok {
-			return current
+			return current, false, fmt.Errorf("compaction summarization failed")
 		}
 		newSummary = historyResult + "\n\n---\n\n**Turn Context (split turn):**\n\n" + tp
 	} else {
 		ns, ok := s.generateSummary(ctx, history, settings.ReserveTokens, previousSummary, settings.SessionID)
 		if !ok {
-			return current
+			return current, false, fmt.Errorf("compaction summarization failed")
 		}
 		newSummary = ns
 	}
@@ -721,7 +751,7 @@ func (s *Session) compact(ctx context.Context, state *compactionState, messages 
 	// produced: _runAutoCompaction calls signal.throwIfAborted() after compact()
 	// and before appendCompaction.
 	if ctx.Err() != nil {
-		return current
+		return current, false, ctx.Err()
 	}
 
 	// Merge file ops from the previous compaction's lists plus the newly
@@ -745,7 +775,7 @@ func (s *Session) compact(ctx context.Context, state *compactionState, messages 
 	// A previous compaction's details value with no string form makes pi's
 	// sort or join throw, and the compaction fails after its summaries.
 	if !stringForms(readFiles) || !stringForms(modifiedFiles) {
-		return current
+		return current, false, fmt.Errorf("invalid checkpoint file list")
 	}
 	newSummary += formatFileOperations(readFiles, modifiedFiles)
 
@@ -763,12 +793,77 @@ func (s *Session) compact(ctx context.Context, state *compactionState, messages 
 		next.systemMessage = &replay
 	}
 
+	if s.ordered != nil {
+		if err := s.ordered.CommitCheckpoint(ctx, OrderedCheckpoint{ThroughSequence: int64(len(messages)), FirstKeptSequence: int64(next.prefixLen + 1), Summary: next.summary}); err != nil {
+			return current, false, fmt.Errorf("checkpoint commit: %w", err)
+		}
+	}
 	state.mu.Lock()
 	state.checkpoint = next
 	state.usageFrom = next.compactedLen
 	state.mu.Unlock()
 
-	return next.apply(messages)
+	return next.apply(messages), true, nil
+}
+
+// CompactOrderedAtProvider performs an explicit, deferred ordered compaction on
+// the serial provider lane. The host supplies the checked cut and commits its
+// fenced checkpoint before the SDK publishes the compacted view. It must never
+// be called from a tool Execute callback. An error leaves the live view intact.
+func (s *Session) CompactOrderedAtProvider(ctx context.Context, messages []agent.AgentMessage, firstKeptSequence int64, commit func(OrderedCheckpoint) error) ([]agent.AgentMessage, error) {
+	if s.ordered == nil || commit == nil || firstKeptSequence < 2 || firstKeptSequence > int64(len(messages)) || s.Model == nil || s.Model.ContextWindow <= 0 {
+		return nil, fmt.Errorf("ordered compaction boundary unavailable")
+	}
+	if s.compactState == nil {
+		s.compactState = &compactionState{}
+	}
+	state := s.compactState
+	state.mu.Lock()
+	previous := state.checkpoint
+	state.mu.Unlock()
+	if previous != nil {
+		return nil, fmt.Errorf("ordered compaction already active")
+	}
+	prefix := int(firstKeptSequence - 1)
+	older := withoutSystemMessages(messages[:prefix])
+	if len(older) == 0 {
+		return nil, fmt.Errorf("ordered compaction has no history")
+	}
+	summary, ok := s.generateSummary(ctx, older, DefaultCompactionSettings.ReserveTokens, "", s.sessionID)
+	if !ok || summary == "" || ctx.Err() != nil {
+		return nil, fmt.Errorf("compaction summarization failed")
+	}
+	readFiles, modifiedFiles := computeFileLists(older)
+	summary += formatFileOperations(readFiles, modifiedFiles)
+	next := &compactionCheckpoint{prefixLen: prefix, compactedLen: len(messages), summary: summary, readFiles: readFiles, modifiedFiles: modifiedFiles}
+	if system, found := ai.GetCurrentSystemMessage(messages); found {
+		next.systemMessage = &system
+	}
+	view := next.apply(messages)
+	// Compare the actual replacement against the same projected context before
+	// compaction. System/tool state is replayed, not summarized: count it once
+	// on both sides rather than treating its removal as progress.
+	before := EstimateContextTokens(withoutSystemMessages(messages))
+	if next.systemMessage != nil {
+		before += EstimateMessageTokens(*next.systemMessage)
+	}
+	if EstimateContextTokens(view) >= before {
+		return nil, fmt.Errorf("compacted context did not reduce token estimate")
+	}
+	// A missing or insufficient budget is not permission to send an oversized
+	// continuation. This check precedes the irreversible host commit.
+	if EstimateContextTokens(view)+DefaultCompactionSettings.ReserveTokens > s.Model.ContextWindow {
+		return nil, fmt.Errorf("compacted context has insufficient headroom")
+	}
+	checkpoint := OrderedCheckpoint{ThroughSequence: int64(len(messages)), FirstKeptSequence: firstKeptSequence, Summary: summary}
+	if err := commit(checkpoint); err != nil {
+		return nil, fmt.Errorf("checkpoint commit: %w", err)
+	}
+	state.mu.Lock()
+	state.checkpoint = next
+	state.usageFrom = len(messages)
+	state.mu.Unlock()
+	return view, nil
 }
 
 // summarize asks the model to produce a structured checkpoint of older messages
@@ -919,6 +1014,12 @@ func (s *Session) completeSummarization(ctx context.Context, promptText string, 
 		CacheRetention: ai.CacheNone,
 		SessionID:      sessionID,
 	}}
+	// Codex summary calls need the same request-scoped token source as normal
+	// turns. Other providers keep their existing key/header behavior.
+	if requestModel != nil && requestModel.Provider == "openai-codex" {
+		opts.CodexAuth = s.Agent.CodexAuth
+		opts.HTTPClient = s.Agent.HTTPClient
+	}
 	// pi 6b36eb592 withdrew the `toolChoice: "none"` 90305d90a had forced here:
 	// summarization leaves the option absent and lets the provider default apply.
 	// A summary is still text, never a tool call — the guard below enforces that

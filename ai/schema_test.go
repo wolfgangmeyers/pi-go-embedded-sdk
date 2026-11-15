@@ -372,7 +372,7 @@ func TestMatchesJSONTypeRejectsNonFinite(t *testing.T) {
 }
 
 // TestKeywordEnforcement locks G2: TypeBox-checked keywords must be enforced
-// with TypeBox en_US message wording.
+// while exposing only a safe generic validation diagnostic.
 func TestKeywordEnforcement(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -411,8 +411,8 @@ func TestKeywordEnforcement(t *testing.T) {
 		_, err := ValidateToolArguments(tool, ToolCall{Name: "t", Arguments: map[string]any{"v": c.bad}})
 		if err == nil {
 			t.Errorf("%s: invalid value %#v accepted", c.name, c.bad)
-		} else if !strings.Contains(err.Error(), c.msg) {
-			t.Errorf("%s: error %q does not contain %q", c.name, err.Error(), c.msg)
+		} else if !strings.Contains(err.Error(), "failed schema validation") {
+			t.Errorf("%s: unexpected diagnostic %q", c.name, err.Error())
 		}
 	}
 }
