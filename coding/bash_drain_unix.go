@@ -15,12 +15,21 @@ import (
 
 type bashDrainOps struct {
 	setNonblock func(int, bool) error
-	pipe        func([]int) error
+	pipe        func() (*os.File, *os.File, error)
 	read        func(int, []byte) (int, error)
 	poll        func([]unix.PollFd, int) (int, error)
 }
 
-var defaultBashDrainOps = bashDrainOps{unix.SetNonblock, unix.Pipe, unix.Read, unix.Poll}
+var defaultBashDrainOps = bashDrainOps{unix.SetNonblock, os.Pipe, unix.Read, unix.Poll}
+
+// stopBashOnDrainFailure uses the command's cancellation policy when supplied.
+func stopBashOnDrainFailure(cmd *exec.Cmd) {
+	if cmd.Cancel != nil {
+		_ = cmd.Cancel()
+	} else {
+		_ = cmd.Process.Kill()
+	}
+}
 
 // drainBashPipe owns the reader until EOF or a post-exit idle interval.
 // Callbacks are synchronous and can block indefinitely.
@@ -33,19 +42,20 @@ func drainBashPipeWithOps(cmd *exec.Cmd, pr *os.File, w io.Writer, ops bashDrain
 	failSetup := func(err error) error {
 		// Close before waiting: the child must not block on an undrained pipe.
 		_ = pr.Close()
-		return errors.Join(err, cmd.Wait())
+		stopBashOnDrainFailure(cmd)
+		return errors.Join(drainFailure(err), cmd.Wait())
 	}
 	if err := ops.setNonblock(fd, true); err != nil {
 		return failSetup(fmt.Errorf("bash output nonblocking setup: %w", err))
 	}
-	wake := []int{-1, -1}
-	if err := ops.pipe(wake); err != nil {
+	wakeRead, wakeWrite, err := ops.pipe()
+	if err != nil {
 		return failSetup(fmt.Errorf("bash output wake pipe: %w", err))
 	}
 	done := make(chan error, 1)
 	go func() {
 		defer pr.Close()
-		defer unix.Close(wake[0])
+		defer wakeRead.Close()
 		buf := make([]byte, 32*1024)
 		var idleSince time.Time
 		exited := false
@@ -64,7 +74,7 @@ func drainBashPipeWithOps(cmd *exec.Cmd, pr *os.File, w io.Writer, ops bashDrain
 				continue
 			}
 			if !errors.Is(err, unix.EAGAIN) && !errors.Is(err, unix.EWOULDBLOCK) {
-				done <- fmt.Errorf("bash output read: %w", err)
+				done <- drainFailure(fmt.Errorf("bash output read: %w", err))
 				return
 			}
 			timeout := -1
@@ -81,22 +91,22 @@ func drainBashPipeWithOps(cmd *exec.Cmd, pr *os.File, w io.Writer, ops bashDrain
 			}
 			fds := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
 			if !exited {
-				fds = append(fds, unix.PollFd{Fd: int32(wake[0]), Events: unix.POLLIN})
+				fds = append(fds, unix.PollFd{Fd: int32(wakeRead.Fd()), Events: unix.POLLIN})
 			}
 			_, err = ops.poll(fds, timeout)
 			if err != nil {
 				if errors.Is(err, unix.EINTR) {
 					continue
 				}
-				done <- fmt.Errorf("bash output poll: %w", err)
+				done <- drainFailure(fmt.Errorf("bash output poll: %w", err))
 				return
 			}
 			if fds[0].Revents&unix.POLLERR != 0 {
-				done <- fmt.Errorf("bash output poll: pipe error")
+				done <- drainFailure(fmt.Errorf("bash output poll: pipe error"))
 				return
 			}
 			if fds[0].Revents&unix.POLLNVAL != 0 {
-				done <- fmt.Errorf("bash output poll: %w", unix.EBADF)
+				done <- drainFailure(fmt.Errorf("bash output poll: %w", unix.EBADF))
 				return
 			}
 			if !exited && fds[1].Revents != 0 {
@@ -104,10 +114,21 @@ func drainBashPipeWithOps(cmd *exec.Cmd, pr *os.File, w io.Writer, ops bashDrain
 			}
 		}
 	}()
-	waitErr := cmd.Wait()
-	// Closing the write end wakes poll, including when exit races the first poll.
-	_ = unix.Close(wake[1])
-	drainErr := <-done
+	waited := make(chan error, 1)
+	go func() { waited <- cmd.Wait() }()
+	var waitErr, drainErr error
+	select {
+	case waitErr = <-waited:
+		// Closing the write end wakes poll, even if exit races the first poll.
+		_ = wakeWrite.Close()
+		drainErr = <-done
+	case drainErr = <-done:
+		if drainErr != nil {
+			stopBashOnDrainFailure(cmd)
+		}
+		waitErr = <-waited
+		_ = wakeWrite.Close()
+	}
 	if drainErr == nil {
 		return waitErr
 	}

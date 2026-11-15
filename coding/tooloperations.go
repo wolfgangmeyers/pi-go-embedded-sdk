@@ -110,6 +110,14 @@ type BashOperations struct {
 	Exec func(ctx context.Context, command, cwd string, options BashExecOptions) (exitCode *int, err error)
 }
 
+// bashDrainError marks an infrastructure failure, distinct from a shell exit.
+type bashDrainError struct{ err error }
+
+func (e *bashDrainError) Error() string { return e.err.Error() }
+func (e *bashDrainError) Unwrap() error { return e.err }
+
+func drainFailure(err error) error { return &bashDrainError{err: err} }
+
 // LocalBashOperations runs commands on the local machine through the shell the
 // tool config resolves, porting pi's createLocalBashOperations (bash.ts:84).
 func LocalBashOperations(config shellToolConfig) BashOperations {
@@ -174,6 +182,10 @@ func classifyShellRun(ctxErr, runCtxErr, runErr error, timeoutSeconds float64) (
 		return nil, &ShellTimeoutError{Seconds: timeoutSeconds}
 	}
 	if runErr != nil {
+		var drainErr *bashDrainError
+		if errors.As(runErr, &drainErr) {
+			return nil, runErr
+		}
 		var exitErr *exec.ExitError
 		if !errors.As(runErr, &exitErr) {
 			return nil, runErr
