@@ -1,8 +1,8 @@
 # Bash output and process lifetime
 
 On Linux and macOS, the SDK observes shell exit without reaping. It reads merged
-stdout/stderr until EOF or 100 ms of post-exit inactivity. Output resets the idle
-timer. Active output can continue beyond one second, but at two seconds after
+stdout/stderr until EOF or the hard post-exit limit. Quiet periods do not end the drain.
+At two seconds after
 exit observation the drain closes the pipe and returns `ErrBashOutputIncomplete`
 if EOF has not been observed. This reports possible truncation even when no bytes
 are immediately available. A final read preserves some buffered output; a slow

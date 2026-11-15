@@ -84,13 +84,12 @@ func drainBashPipeWithOpsFinish(cmd *exec.Cmd, pr *os.File, w io.Writer, ops bas
 		defer pr.Close()
 		defer wakeRead.Close()
 		buf := make([]byte, 32*1024)
-		var deadline, limit time.Time
+		var limit time.Time
 		exited := false
 		for {
 			if !exited {
 				if at := exitAt.Load(); at != nil {
 					exited = true
-					deadline = at.Add(bashExitStdioGrace)
 					limit = at.Add(bashExitStdioLimit)
 				}
 			}
@@ -102,9 +101,6 @@ func drainBashPipeWithOpsFinish(cmd *exec.Cmd, pr *os.File, w io.Writer, ops bas
 				if hardExpired {
 					done <- drainFailure(ErrBashOutputIncomplete)
 					return
-				}
-				if exited {
-					deadline = time.Now().Add(bashExitStdioGrace)
 				}
 				continue
 			}
@@ -125,17 +121,9 @@ func drainBashPipeWithOpsFinish(cmd *exec.Cmd, pr *os.File, w io.Writer, ops bas
 			}
 			timeout := -1
 			if exited {
-				until := deadline
-				if limit.Before(until) {
-					until = limit
-				}
-				remaining := time.Until(until)
+				remaining := time.Until(limit)
 				if remaining <= 0 {
-					if !time.Now().Before(limit) {
-						done <- drainFailure(ErrBashOutputIncomplete)
-						return
-					}
-					done <- nil
+					done <- drainFailure(ErrBashOutputIncomplete)
 					return
 				}
 				timeout = int((remaining + time.Millisecond - 1) / time.Millisecond)
@@ -163,7 +151,6 @@ func drainBashPipeWithOpsFinish(cmd *exec.Cmd, pr *os.File, w io.Writer, ops bas
 			if !exited && fds[1].Revents != 0 {
 				exited = true
 				at := exitAt.Load()
-				deadline = at.Add(bashExitStdioGrace)
 				limit = at.Add(bashExitStdioLimit)
 			}
 		}

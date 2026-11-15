@@ -110,7 +110,7 @@ type BashOperations struct {
 	Exec func(ctx context.Context, command, cwd string, options BashExecOptions) (exitCode *int, err error)
 }
 
-// ErrBashOutputIncomplete means the post-exit limit closed a still-open output pipe.
+// ErrBashOutputIncomplete means the post-exit limit closed an output pipe before EOF.
 var ErrBashOutputIncomplete = errors.New("bash output incomplete: post-exit drain limit reached")
 
 // bashDrainError marks an infrastructure failure, distinct from a shell exit.

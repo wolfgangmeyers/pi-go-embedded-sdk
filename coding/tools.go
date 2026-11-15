@@ -1019,6 +1019,10 @@ func shellToolOps(cwd string, config shellToolConfig, sessionEnv sessionEnvFn, c
 					// renders "0.5" and 2 renders "2".
 					return agent.AgentToolResult{}, fmt.Errorf("%s", appendStatus(text, fmt.Sprintf("Command timed out after %s seconds", strconv.FormatFloat(timeoutErr.Seconds, 'g', -1, 64))))
 				}
+				if errors.Is(execErr, ErrBashOutputIncomplete) {
+					text, _ := formatOutput("")
+					return agent.AgentToolResult{}, fmt.Errorf("%s: %w", text, execErr)
+				}
 				return agent.AgentToolResult{}, execErr
 			}
 			// pi a8b3dd199 (#9577): a command with no exit code at all fails

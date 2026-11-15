@@ -2,6 +2,7 @@ package coding
 
 import (
 	"context"
+	"errors"
 	"runtime"
 	"strings"
 	"sync"
@@ -98,15 +99,15 @@ func TestBashReleasesPromptlyOnQuietHeldPipe(t *testing.T) {
 	final, err := bashTool(t.TempDir(), nil).Execute(context.Background(), "id",
 		map[string]any{"command": command}, nil)
 	elapsed := time.Since(start)
-	if err != nil {
-		t.Fatal(err)
-	}
-	got := resultText(final)
-	if !strings.Contains(got, "DONE") {
-		t.Fatalf("expected DONE in output, got %q", got)
+	if runtime.GOOS == "linux" || runtime.GOOS == "darwin" {
+		if !errors.Is(err, ErrBashOutputIncomplete) || !strings.Contains(err.Error(), "DONE") {
+			t.Fatalf("expected output and incomplete error, got %v", err)
+		}
+	} else if err != nil || !strings.Contains(resultText(final), "DONE") {
+		t.Fatalf("output %q error %v", resultText(final), err)
 	}
 	// Must not wait for the 30s sleeper; the bounded window releases us.
-	if elapsed > 2*time.Second {
-		t.Fatalf("expected prompt release via idle grace, took %s", elapsed)
+	if elapsed > 10*time.Second {
+		t.Fatalf("expected bounded release, took %s", elapsed)
 	}
 }

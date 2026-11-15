@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -83,7 +84,7 @@ func TestBashDrainDescendantIdleAndOutput(t *testing.T) {
 		}()
 		select {
 		case err := <-done:
-			if err != nil || out.String() != "done" {
+			if !errors.Is(err, ErrBashOutputIncomplete) || out.String() != "done" {
 				t.Fatalf("output %q err %v", out.String(), err)
 			}
 		case <-time.After(10 * time.Second):
@@ -152,27 +153,78 @@ func TestBashDrainContinuousDescendantIsBounded(t *testing.T) {
 }
 
 func TestBashDrainCancelAfterParentExit(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "sh", "-c", `(while :; do printf x; done) & exit 0`)
 	setProcessGroup(cmd)
 	cmd.Cancel = func() error { return killProcessTree(cmd) }
 	done := make(chan error, 1)
 	ready := make(chan struct{})
+	release := make(chan struct{})
 	var once sync.Once
 	go func() {
-		done <- runBashCommand(cmd, writerFunc(func(p []byte) (int, error) { once.Do(func() { close(ready) }); return len(p), nil }))
+		done <- runBashCommand(cmd, writerFunc(func(p []byte) (int, error) {
+			once.Do(func() { close(ready); <-release })
+			return len(p), nil
+		}))
 	}()
-	<-ready
-	// The observer leaves the shell waitable; waitid observes its actual exit.
-	if err := observeBashExit(cmd.Process.Pid); err != nil {
-		t.Fatal(err)
+	select {
+	case <-ready:
+	case <-ctx.Done():
+		close(release)
+		t.Fatal("no output")
+	}
+	// The blocked callback prevents reaping while waitid observes actual exit.
+	exited := make(chan error, 1)
+	go func() { exited <- observeBashExit(cmd.Process.Pid) }()
+	select {
+	case err := <-exited:
+		if err != nil {
+			close(release)
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		close(release)
+		t.Fatal("shell did not exit")
 	}
 	cancel()
+	close(release)
 	select {
 	case <-done:
-	case <-time.After(3 * time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("cancellation did not finish drain")
+	}
+}
+
+func TestBashDrainDelayedDescendantOutput(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "sh", "-c", `(sleep .3; printf late) & printf early; exit 0`)
+	var out bytes.Buffer
+	if err := runBashCommand(cmd, &out); err != nil || out.String() != "earlylate" {
+		t.Fatalf("output %q err %v", out.String(), err)
+	}
+}
+
+func TestBashToolIncompleteRetainsOutput(t *testing.T) {
+	dir := t.TempDir()
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+	_, err := bashTool(dir, nil).Execute(ctx, "id", map[string]any{
+		"command": `(printf marker; head -c 100000 /dev/zero | tr "\0" x; sleep 4) & exit 0`,
+	}, nil)
+	if !errors.Is(err, ErrBashOutputIncomplete) || !strings.Contains(err.Error(), "Full output: ") {
+		t.Fatalf("missing incomplete error or path: %v", err)
+	}
+	parts := strings.SplitN(err.Error(), "Full output: ", 2)
+	path := strings.SplitN(parts[1], "]", 2)[0]
+	data, readErr := os.ReadFile(path)
+	if readErr != nil || !bytes.HasPrefix(data, []byte("marker")) {
+		t.Fatalf("full output %q: %v", path, readErr)
+	}
+	os.Remove(path)
+	if !strings.Contains(err.Error(), strings.Repeat("x", 100)) {
+		t.Fatal("missing captured output")
 	}
 }
 
@@ -198,24 +250,54 @@ func TestBashDrainLimitReportedByOperations(t *testing.T) {
 }
 
 func TestBashDrainCancellationClassificationAfterExit(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	dir := t.TempDir()
+	pidFile := filepath.Join(dir, "pid")
 	ops := LocalBashOperations(bashShellConfig)
-	ready := make(chan struct{})
+	ready, release := make(chan struct{}), make(chan struct{})
 	var once sync.Once
 	done := make(chan error, 1)
 	go func() {
-		_, err := ops.Exec(ctx, `(while :; do printf x; done) & exit 0`, t.TempDir(), BashExecOptions{Env: os.Environ(), OnData: func([]byte) { once.Do(func() { close(ready) }) }})
+		_, err := ops.Exec(ctx, `echo $$ > pid; (while :; do printf x; done) & exit 0`, dir, BashExecOptions{Env: os.Environ(), OnData: func([]byte) { once.Do(func() { close(ready); <-release }) }})
 		done <- err
 	}()
-	<-ready
+	select {
+	case <-ready:
+	case <-ctx.Done():
+		close(release)
+		t.Fatal("no output")
+	}
+	data, err := os.ReadFile(pidFile)
+	if err != nil {
+		close(release)
+		t.Fatal(err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		close(release)
+		t.Fatal(err)
+	}
+	exited := make(chan error, 1)
+	go func() { exited <- observeBashExit(pid) }()
+	select {
+	case err := <-exited:
+		if err != nil {
+			close(release)
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		close(release)
+		t.Fatal("shell did not exit")
+	}
 	cancel()
+	close(release)
 	select {
 	case err := <-done:
 		if !errors.Is(err, ErrShellAborted) {
 			t.Fatalf("error %v", err)
 		}
-	case <-time.After(4 * time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("cancellation did not complete")
 	}
 }
