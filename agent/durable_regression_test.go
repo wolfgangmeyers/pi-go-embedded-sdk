@@ -154,3 +154,44 @@ func TestParallelAdmissionFailureJoinsAdmittedCall(t *testing.T) {
 		t.Fatal("did not finish")
 	}
 }
+
+func TestParallelAdmissionHooksAllowWorkerUpdatesAndFinalization(t *testing.T) {
+	updated := make(chan struct{})
+	finalized := make(chan struct{})
+	calls := []ai.ToolCall{{ID: "one", Name: "effect", Arguments: map[string]any{}}, {ID: "two", Name: "effect", Arguments: map[string]any{}}}
+	tool := AgentTool{Name: "effect", Parameters: &ai.Schema{Type: "object"}, Execute: func(_ context.Context, id string, _ map[string]any, update ToolUpdateFunc) (AgentToolResult, error) {
+		if id == "one" {
+			update(AgentToolResult{})
+		}
+		return AgentToolResult{}, nil
+	}}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		executeToolCalls(context.Background(), &AgentContext{Tools: []AgentTool{tool}}, &ai.AssistantMessage{Content: ai.ContentList{calls[0], calls[1]}}, AgentLoopConfig{
+			BeforeToolExecute: func(_ context.Context, c BeforeToolCallContext) error {
+				if c.ToolCall.ID == "two" {
+					<-updated
+					<-finalized
+				}
+				return nil
+			},
+			AfterToolCall: func(_ context.Context, c AfterToolCallContext) *AfterToolCallResult {
+				if c.ToolCall.ID == "one" {
+					close(finalized)
+				}
+				return nil
+			},
+		}, func(e AgentEvent) error {
+			if e.Type == EvToolExecutionUpdate {
+				close(updated)
+			}
+			return nil
+		})
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("admission blocked worker callbacks")
+	}
+}

@@ -36,6 +36,8 @@ type emitPanic struct{ err error }
 // unwinds to Agent's failure boundary without publishing a tool result.
 type toolAdmissionAbort struct{ err error }
 
+type parallelWorkerAbort struct{ cause any }
+
 // PolicyDenial is a host policy rejection before durable effect intent. Only
 // BeforeToolExecute may return it; all other admission failures remain fatal.
 type PolicyDenial struct{ Reason string }
@@ -650,34 +652,53 @@ func executeToolCallsSequential(ctx context.Context, current *AgentContext, msg 
 // admission. Steering can skip only calls that have not yet been admitted. Once
 // admitted, a call must run even if steering or cancellation arrives later.
 func executeAdmittedCallsParallel(ctx context.Context, current *AgentContext, msg *ai.AssistantMessage, calls []ai.ToolCall, config AgentLoopConfig, emit EventSink) executedBatch {
-	var mu sync.Mutex
-	var wg sync.WaitGroup
-	var panicOnce sync.Once
+	var fatalMu sync.Mutex
 	var workerPanic any
-	// An admission hook or listener may panic while earlier calls are running.
-	// Always join them before unwinding; cancelling them would strand intents.
-	defer wg.Wait()
-	safeEmit := func(e AgentEvent) error {
-		mu.Lock()
-		defer mu.Unlock()
-		return emit(e)
+	publishFatal := func(r any) {
+		fatalMu.Lock()
+		if workerPanic == nil {
+			workerPanic = r
+		}
+		fatalMu.Unlock()
 	}
+	checkFatal := func() {
+		fatalMu.Lock()
+		r := workerPanic
+		fatalMu.Unlock()
+		if r != nil {
+			panic(parallelWorkerAbort{cause: r})
+		}
+	}
+	var wg sync.WaitGroup
+	// An admission hook or listener may panic while earlier calls are running.
+	// Admitted workers must settle before any failure escapes.
+	defer func() {
+		r := recover()
+		wg.Wait()
+		if abort, ok := r.(parallelWorkerAbort); ok {
+			panic(abort.cause)
+		}
+		if r != nil {
+			panic(r)
+		}
+	}()
 	outcomes := make([]AgentToolCallOutcome, len(calls))
 	count := 0
 	for i, tc := range calls {
-		count++
+		checkFatal()
+		interrupted := config.HasSteeringMessages != nil && config.HasSteeringMessages()
+		checkFatal()
+		mustEmit(emit, AgentEvent{Type: EvToolExecutionStart, ToolCallID: tc.ID, ToolName: tc.Name, Args: tc.Arguments})
+		checkFatal()
 		var prep prepareResult
-		interrupted := false
-		func() {
-			mu.Lock()
-			defer mu.Unlock()
-			interrupted = config.HasSteeringMessages != nil && config.HasSteeringMessages()
-			mustEmit(emit, AgentEvent{Type: EvToolExecutionStart, ToolCallID: tc.ID, ToolName: tc.Name, Args: tc.Arguments})
-			if !interrupted {
-				prep = prepareToolCall(ctx, current, msg, tc, config.toolCallHooks(), current.Tools)
-			}
-		}()
+		if !interrupted {
+			hooks := config.toolCallHooks()
+			hooks.checkFatal = checkFatal
+			prep = prepareToolCall(ctx, current, msg, tc, hooks, current.Tools)
+		}
+		count++
 		if interrupted || prep.immediate != nil || prep.replay != nil {
+			checkFatal()
 			var fo AgentToolCallOutcome
 			switch {
 			case interrupted:
@@ -688,35 +709,30 @@ func executeAdmittedCallsParallel(ctx context.Context, current *AgentContext, ms
 				fo = replayOutcome(tc, prep.replay)
 			}
 			outcomes[i] = fo
-			emitToolExecutionEnd(fo, safeEmit)
+			emitToolExecutionEnd(fo, emit)
 			if aborted(ctx) && !interrupted {
 				break
 			}
 			continue
 		}
+		// Successful admission commits this call even if a sibling fails now.
 		prepared := *prep.prepared
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
 			defer func() {
 				if r := recover(); r != nil {
-					panicOnce.Do(func() { workerPanic = r })
+					publishFatal(r)
 				}
 			}()
-			executed := executePreparedToolCall(ctx, prepared, emitToolExecutionUpdate(prepared.toolCall, safeEmit))
-			func() {
-				mu.Lock()
-				defer mu.Unlock()
-				fo := finalizeExecutedToolCall(ctx, current, msg, prepared, executed, config.toolCallHooks())
-				outcomes[i] = fo
-				emitToolExecutionEnd(fo, emit)
-			}()
+			executed := executePreparedToolCall(ctx, prepared, emitToolExecutionUpdate(prepared.toolCall, emit))
+			fo := finalizeExecutedToolCall(ctx, current, msg, prepared, executed, config.toolCallHooks())
+			outcomes[i] = fo
+			emitToolExecutionEnd(fo, emit)
 		}(i)
 	}
 	wg.Wait()
-	if workerPanic != nil {
-		panic(workerPanic)
-	}
+	checkFatal()
 	var messages []ai.ToolResultMessage
 	for _, fo := range outcomes[:count] {
 		trm := createToolResultMessage(fo)
@@ -935,6 +951,9 @@ func prepareToolCall(ctx context.Context, current *AgentContext, msg *ai.Assista
 			if abort, ok := r.(toolAdmissionAbort); ok {
 				panic(abort)
 			}
+			if abort, ok := r.(parallelWorkerAbort); ok {
+				panic(abort)
+			}
 			res = prepareResult{immediate: &immediateOutcome{result: errorToolResult(panicMessage(r)), isError: true}}
 		}
 	}()
@@ -985,6 +1004,9 @@ func prepareToolCall(ctx context.Context, current *AgentContext, msg *ai.Assista
 		return prepareResult{immediate: &immediateOutcome{result: errorToolResult("Operation aborted"), isError: true}}
 	}
 	if hooks.BeforeToolExecute != nil {
+		if hooks.checkFatal != nil {
+			hooks.checkFatal()
+		}
 		// Keep admission outside tool Execute's error-to-result conversion.
 		// Only a typed pre-intent policy denial may continue as a checked result.
 		func() {
@@ -1029,6 +1051,7 @@ func prepareToolCall(ctx context.Context, current *AgentContext, msg *ai.Assista
 // AgentLoopConfig (pi's Pick<AgentLoopConfig, "beforeToolCall" |
 // "afterToolCall">, upstream 8562bcf66).
 type ToolCallHooks struct {
+	checkFatal        func()
 	BeforeToolExecute func(context.Context, BeforeToolCallContext) error
 	ReplayToolResult  func(context.Context, BeforeToolCallContext) (*ai.ToolResultMessage, error)
 	BeforeToolCall    BeforeToolCallFunc
