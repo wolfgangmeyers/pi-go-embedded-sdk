@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -183,7 +184,19 @@ func TestBashDrainFailureAfterExitKillsGroupBeforeReap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.CommandContext(context.Background(), "sh", "-c", `(sleep 30) & exit 0`)
+	// The inherited pipe independently witnesses the descendant closing on
+	// cancellation, and the sleep bounds its lifetime on every failure path.
+	ackRead, ackWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ackRead.Close()
+	defer ackWrite.Close()
+	ready := filepath.Join(t.TempDir(), "ready")
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "sh", "-c", `(touch "$1"; exec sleep 4) & while [ ! -f "$1" ]; do sleep .01; done; exit 0`, "sh", ready)
+	cmd.ExtraFiles = []*os.File{ackWrite}
 	setProcessGroup(cmd)
 	called := make(chan struct{}, 1)
 	cmd.Cancel = func() error { called <- struct{}{}; return killProcessTree(cmd) }
@@ -192,6 +205,9 @@ func TestBashDrainFailureAfterExitKillsGroupBeforeReap(t *testing.T) {
 		t.Fatal(err)
 	}
 	pw.Close()
+	if err := ackWrite.Close(); err != nil {
+		t.Fatal(err)
+	}
 	if err := observeBashExit(cmd.Process.Pid); err != nil {
 		t.Fatal(err)
 	}
@@ -206,6 +222,16 @@ func TestBashDrainFailureAfterExitKillsGroupBeforeReap(t *testing.T) {
 	case <-called:
 	default:
 		t.Fatal("group cancellation not called")
+	}
+	closed := make(chan error, 1)
+	go func() { _, err := io.Copy(io.Discard, ackRead); closed <- err }()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("descendant retained its pipe after cancellation")
 	}
 }
 
