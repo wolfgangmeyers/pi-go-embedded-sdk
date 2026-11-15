@@ -20,7 +20,7 @@ func TestProviderTerminalReasonsAndStarts(t *testing.T) {
 		{"tool", ai.EventDone, ai.StopToolUse, ai.StopToolUse, ai.StopToolUse, false},
 		{"length", ai.EventDone, ai.StopLength, ai.StopLength, ai.StopLength, false},
 		{"omitted event", ai.EventDone, "", ai.StopToolUse, ai.StopToolUse, false},
-		{"omitted message", ai.EventDone, ai.StopToolUse, "", "", false},
+		{"omitted message", ai.EventDone, ai.StopToolUse, "", ai.StopToolUse, false},
 		{"contradiction", ai.EventDone, ai.StopStop, ai.StopToolUse, ai.StopError, true},
 		{"error contradiction", ai.EventError, ai.StopError, ai.StopToolUse, ai.StopError, true},
 		{"empty error", ai.EventError, "", "", ai.StopError, true},
@@ -107,5 +107,65 @@ func TestContradictoryTerminalDoesNotExecuteTools(t *testing.T) {
 			t.Fatalf("cancel=%v runs=%d message=%+v", cancelFirst, runs, m)
 		}
 		cancel()
+	}
+}
+
+func TestTerminalReasonControlsFullLoop(t *testing.T) {
+	for _, tt := range []struct {
+		name                 string
+		event, message, want ai.StopReason
+		runs                 int
+		resultError          bool
+		followup             bool
+	}{
+		{"length", ai.StopLength, "", ai.StopLength, 0, true, true},
+		{"stop compatibility", ai.StopStop, "", ai.StopStop, 1, false, true},
+		{"tool use", ai.StopToolUse, "", ai.StopToolUse, 1, false, true},
+		{"conflicting", ai.StopStop, ai.StopToolUse, ai.StopError, 0, false, false},
+		{"both empty", "", "", "", 1, false, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			runs, calls := 0, 0
+			tool := AgentTool{Name: "danger", Parameters: ai.Object(), Execute: func(context.Context, string, map[string]any, ToolUpdateFunc) (AgentToolResult, error) {
+				runs++
+				return AgentToolResult{Content: ai.ContentList{ai.TextContent{Text: "ok"}}}, nil
+			}}
+			original := &ai.AssistantMessage{StopReason: tt.message, Content: ai.ContentList{ai.ToolCall{ID: "1", Name: "danger", Arguments: map[string]any{}}}}
+			fn := func(_ context.Context, _ *ai.Model, _ ai.TranscriptContext, _ *ai.SimpleStreamOptions) *ai.AssistantMessageEventStream {
+				calls++
+				s := ai.NewAssistantMessageEventStream()
+				if calls == 1 {
+					s.Push(ai.AssistantMessageEvent{Type: ai.EventDone, Reason: tt.event, Message: original})
+				} else {
+					s.Push(ai.AssistantMessageEvent{Type: ai.EventDone, Reason: ai.StopStop, Message: &ai.AssistantMessage{StopReason: ai.StopStop}})
+				}
+				return s
+			}
+			stream := AgentLoop(context.Background(), []AgentMessage{ai.NewUserText("hello", 1)}, AgentContext{Tools: []AgentTool{tool}}, AgentLoopConfig{Model: &ai.Model{}}, fn)
+			for range stream.Events() {
+			}
+			msgs := stream.Result()
+			var first *ai.AssistantMessage
+			var results []ai.ToolResultMessage
+			for _, msg := range msgs {
+				switch m := msg.(type) {
+				case *ai.AssistantMessage:
+					if first == nil {
+						first = m
+					}
+				case ai.ToolResultMessage:
+					results = append(results, m)
+				}
+			}
+			if first == nil || first.StopReason != tt.want || runs != tt.runs || (calls == 2) != tt.followup || original.StopReason != tt.message {
+				t.Fatalf("first=%+v runs=%d calls=%d original=%+v", first, runs, calls, original)
+			}
+			if tt.followup && (len(results) != 1 || results[0].IsError != tt.resultError) {
+				t.Fatalf("tool results: %+v", results)
+			}
+			if !tt.followup && (len(results) != 0 || first.ErrorMessage == "") {
+				t.Fatalf("failure: %+v results=%+v", first, results)
+			}
+		})
 	}
 }

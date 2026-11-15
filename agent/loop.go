@@ -473,6 +473,9 @@ func streamAssistantResponse(ctx context.Context, agentCtx *AgentContext, config
 				final = failure("provider stream returned contradictory terminal reasons")
 			} else {
 				final = final.Clone()
+				if event.Type == ai.EventDone && final.StopReason == "" {
+					final.StopReason = event.Reason
+				}
 				final.ThinkingLevel = thinkingLevel
 				if event.Type == ai.EventError && final.StopReason != ai.StopError && final.StopReason != ai.StopAborted {
 					final.StopReason = ai.StopError
