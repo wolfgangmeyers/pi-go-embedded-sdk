@@ -390,6 +390,7 @@ func streamAssistantResponse(ctx context.Context, agentCtx *AgentContext, config
 	// A terminal event must carry its corresponding message. An abruptly closed
 	// stream has no terminal response even if End was supplied a result.
 	thinkingLevel := ai.ModelThinkingLevel(config.requestedThinkingLevel())
+	var partial *ai.AssistantMessage
 	failure := func(reason string) *ai.AssistantMessage {
 		stop := ai.StopError
 		if aborted(ctx) {
@@ -402,10 +403,21 @@ func streamAssistantResponse(ctx context.Context, agentCtx *AgentContext, config
 			m.Provider = ai.ProviderId(config.Model.Provider)
 			m.Model = config.Model.ID
 		}
+		if partial != nil {
+			m = partial.Clone()
+			// Incomplete tool calls are not safe to retain or replay.
+			m.Content = nil
+			for _, content := range partial.Content {
+				switch content.(type) {
+				case ai.TextContent, ai.ThinkingContent:
+					m.Content = append(m.Content, content)
+				}
+			}
+			m.StopReason, m.ErrorMessage, m.ThinkingLevel = stop, reason, thinkingLevel
+			m.Deferred = nil
+		}
 		return m
 	}
-
-	var partial *ai.AssistantMessage
 	addedPartial := false
 
 	for event := range response.Events() {
@@ -422,9 +434,15 @@ func streamAssistantResponse(ctx context.Context, agentCtx *AgentContext, config
 		case ai.EventTextStart, ai.EventTextDelta, ai.EventTextEnd,
 			ai.EventThinkingStart, ai.EventThinkingDelta, ai.EventThinkingEnd,
 			ai.EventToolCallStart, ai.EventToolCallDelta, ai.EventToolCallEnd:
-			if partial != nil && event.Partial != nil {
+			if event.Partial != nil {
 				partial = event.Partial
-				agentCtx.Messages[len(agentCtx.Messages)-1] = partial
+				if !addedPartial {
+					agentCtx.Messages = append(agentCtx.Messages, partial)
+					addedPartial = true
+					mustEmit(emit, AgentEvent{Type: EvMessageStart, Message: partial.Clone()})
+				} else {
+					agentCtx.Messages[len(agentCtx.Messages)-1] = partial
+				}
 				ev := event
 				mustEmit(emit, AgentEvent{Type: EvMessageUpdate, AssistantMessageEvent: &ev, Message: partial.Clone()})
 			}
@@ -437,7 +455,11 @@ func streamAssistantResponse(ctx context.Context, agentCtx *AgentContext, config
 			if final == nil {
 				final = failure("provider stream returned a terminal event without a message")
 			} else {
+				final = final.Clone()
 				final.ThinkingLevel = thinkingLevel
+				if event.Type == ai.EventError && final.StopReason != ai.StopError && final.StopReason != ai.StopAborted {
+					final.StopReason = ai.StopError
+				}
 			}
 			if addedPartial {
 				agentCtx.Messages[len(agentCtx.Messages)-1] = final
