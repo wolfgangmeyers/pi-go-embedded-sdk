@@ -573,11 +573,11 @@ func executeToolCalls(ctx context.Context, current *AgentContext, msg *ai.Assist
 			break
 		}
 	}
-	// Durable admissions must be followed by execution before another call can
-	// be admitted or steering can skip it; deferred parallel preparation cannot
-	// uphold that contract. Non-admission batches remain parallel.
-	if config.ToolExecution == ToolSequential || hasSequential || config.BeforeToolExecute != nil {
+	if config.ToolExecution == ToolSequential || hasSequential {
 		return executeToolCallsSequential(ctx, current, msg, toolCalls, config, emit)
+	}
+	if config.BeforeToolExecute != nil {
+		return executeAdmittedCallsParallel(ctx, current, msg, toolCalls, config, emit)
 	}
 	return executeToolCallsParallel(ctx, current, msg, toolCalls, config, emit)
 }
@@ -644,6 +644,86 @@ func executeToolCallsSequential(ctx context.Context, current *AgentContext, msg 
 	}
 
 	return executedBatch{messages: messages, terminate: shouldTerminateBatch(finalized)}
+}
+
+// executeAdmittedCallsParallel commits each call to execution immediately after
+// admission. Steering can skip only calls that have not yet been admitted. Once
+// admitted, a call must run even if steering or cancellation arrives later.
+func executeAdmittedCallsParallel(ctx context.Context, current *AgentContext, msg *ai.AssistantMessage, calls []ai.ToolCall, config AgentLoopConfig, emit EventSink) executedBatch {
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	var panicOnce sync.Once
+	var workerPanic any
+	// An admission hook or listener may panic while earlier calls are running.
+	// Always join them before unwinding; cancelling them would strand intents.
+	defer wg.Wait()
+	safeEmit := func(e AgentEvent) error {
+		mu.Lock()
+		defer mu.Unlock()
+		return emit(e)
+	}
+	outcomes := make([]AgentToolCallOutcome, len(calls))
+	count := 0
+	for i, tc := range calls {
+		count++
+		var prep prepareResult
+		interrupted := false
+		func() {
+			mu.Lock()
+			defer mu.Unlock()
+			interrupted = config.HasSteeringMessages != nil && config.HasSteeringMessages()
+			mustEmit(emit, AgentEvent{Type: EvToolExecutionStart, ToolCallID: tc.ID, ToolName: tc.Name, Args: tc.Arguments})
+			if !interrupted {
+				prep = prepareToolCall(ctx, current, msg, tc, config.toolCallHooks(), current.Tools)
+			}
+		}()
+		if interrupted || prep.immediate != nil || prep.replay != nil {
+			var fo AgentToolCallOutcome
+			switch {
+			case interrupted:
+				fo = interruptedToolOutcome(tc)
+			case prep.immediate != nil:
+				fo = AgentToolCallOutcome{ToolCall: tc, Result: prep.immediate.result, IsError: prep.immediate.isError}
+			default:
+				fo = replayOutcome(tc, prep.replay)
+			}
+			outcomes[i] = fo
+			emitToolExecutionEnd(fo, safeEmit)
+			if aborted(ctx) && !interrupted {
+				break
+			}
+			continue
+		}
+		prepared := *prep.prepared
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					panicOnce.Do(func() { workerPanic = r })
+				}
+			}()
+			executed := executePreparedToolCall(ctx, prepared, emitToolExecutionUpdate(prepared.toolCall, safeEmit))
+			func() {
+				mu.Lock()
+				defer mu.Unlock()
+				fo := finalizeExecutedToolCall(ctx, current, msg, prepared, executed, config.toolCallHooks())
+				outcomes[i] = fo
+				emitToolExecutionEnd(fo, emit)
+			}()
+		}(i)
+	}
+	wg.Wait()
+	if workerPanic != nil {
+		panic(workerPanic)
+	}
+	var messages []ai.ToolResultMessage
+	for _, fo := range outcomes[:count] {
+		trm := createToolResultMessage(fo)
+		emitToolResultMessage(trm, emit)
+		messages = append(messages, trm)
+	}
+	return executedBatch{messages: messages, terminate: shouldTerminateBatch(outcomes[:count])}
 }
 
 func executeToolCallsParallel(ctx context.Context, current *AgentContext, msg *ai.AssistantMessage, toolCalls []ai.ToolCall, config AgentLoopConfig, emit EventSink) executedBatch {
