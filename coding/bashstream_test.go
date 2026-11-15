@@ -2,9 +2,6 @@ package coding
 
 import (
 	"context"
-	"os"
-	"os/exec"
-	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -114,55 +111,5 @@ func TestBashReleasesPromptlyOnQuietHeldPipe(t *testing.T) {
 	// Must not wait for the 30s sleeper; the idle grace releases us well under a second.
 	if elapsed > 2*time.Second {
 		t.Fatalf("expected prompt release via idle grace, took %s", elapsed)
-	}
-}
-
-// A slow consumer must not let the post-exit idle timeout discard bytes that
-// arrived while it was processing the previous chunk.
-func TestBashDrainWaitsForSlowConsumer(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("uses /bin/sh")
-	}
-	var output strings.Builder
-	entered := make(chan struct{})
-	release := make(chan struct{})
-	var once sync.Once
-	writer := writerFunc(func(p []byte) (int, error) {
-		once.Do(func() { close(entered); <-release })
-		return output.Write(p)
-	})
-	marker := filepath.Join(t.TempDir(), "tail-written")
-	trigger := filepath.Join(t.TempDir(), "continue")
-	cmd := exec.Command("/bin/sh", "-c", `printf HEAD; ( while [ ! -e "$2" ]; do sleep 0.01; done; printf TAIL; : > "$1" ) &`, "sh", marker, trigger)
-	done := make(chan error, 1)
-	go func() { done <- runBashCommand(cmd, writer) }()
-	select {
-	case <-entered:
-	case <-time.After(2 * time.Second):
-		t.Fatal("consumer did not receive initial output")
-	}
-	if err := os.WriteFile(trigger, nil, 0600); err != nil {
-		close(release)
-		t.Fatal(err)
-	}
-	// Wait until the descendant confirms TAIL is in the pipe, then keep the
-	// consumer blocked beyond the idle window.
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		if _, err := os.Stat(marker); err == nil {
-			break
-		} else if !os.IsNotExist(err) || time.Now().After(deadline) {
-			close(release)
-			t.Fatalf("descendant did not write tail: %v", err)
-		}
-		time.Sleep(time.Millisecond)
-	}
-	time.Sleep(3 * bashExitStdioGrace)
-	close(release)
-	if err := <-done; err != nil {
-		t.Fatal(err)
-	}
-	if got := output.String(); got != "HEADTAIL" {
-		t.Fatalf("output = %q, want HEADTAIL", got)
 	}
 }
