@@ -47,7 +47,7 @@ func TestOrderedExceptionalFailureCommitsBeforePublishing(t *testing.T) {
 				}
 				if e.Type == agent.EvAgentEnd {
 					terminal = true
-					if len(e.Messages) != 1 {
+					if len(e.Messages) != 3 || e.Messages[2].MessageRole() != ai.RoleAssistant {
 						t.Fatalf("terminal messages: %v", e.Messages)
 					}
 				}
@@ -104,7 +104,7 @@ func TestOrderedRejectionAfterStreamStartIsTerminalOnly(t *testing.T) {
 			}
 		case agent.EvAgentEnd:
 			terminal = true
-			if len(e.Messages) != 0 {
+			if len(e.Messages) != 2 || e.Messages[1].MessageRole() != ai.RoleUser {
 				t.Errorf("uncommitted terminal messages: %v", e.Messages)
 			}
 		}
@@ -144,7 +144,7 @@ func TestOrderedAbortedRejectionHasNoCommittedTerminalMessage(t *testing.T) {
 			}
 		case agent.EvAgentEnd:
 			terminal = true
-			if len(e.Messages) != 0 {
+			if len(e.Messages) != 2 || e.Messages[1].MessageRole() != ai.RoleUser {
 				t.Errorf("uncommitted terminal messages: %v", e.Messages)
 			}
 		}

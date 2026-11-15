@@ -112,9 +112,10 @@ type AgentOptions struct {
 }
 
 type activeRun struct {
-	cancel context.CancelFunc
-	ctx    context.Context
-	done   chan struct{}
+	cancel   context.CancelFunc
+	ctx      context.Context
+	done     chan struct{}
+	messages []AgentMessage
 }
 
 // Agent is a stateful wrapper around the low-level agent loop. It owns the
@@ -535,18 +536,31 @@ func (a *Agent) handleRunFailure(ctx context.Context, msg string, aborted, appen
 	if committed && a.BeforeMessageEnd != nil {
 		if err := a.BeforeMessageEnd(ctx, failure); err != nil {
 			committed = false
-			failure.ErrorMessage = err.Error()
+			failure.ErrorMessage = msg + "; diagnostic append failed: " + err.Error()
 		}
+	}
+	// Persistence succeeded even if a subsequent listener rejects message_start.
+	// Record the diagnostic before calling any listener, and do not append it again
+	// when publishing message_end.
+	if committed {
+		a.mu.Lock()
+		a.state.Messages = append(a.state.Messages, failure)
+		if a.active != nil {
+			a.active.messages = append(a.active.messages, failure)
+		}
+		a.mu.Unlock()
 	}
 	emit := a.eventSink(ctx, false)
 	events := []AgentEvent{}
 	if committed {
 		events = append(events, AgentEvent{Type: EvMessageStart, Message: failure}, AgentEvent{Type: EvMessageEnd, Message: failure})
 	}
+	a.mu.Lock()
 	var messages []AgentMessage
-	if committed {
-		messages = []AgentMessage{failure}
+	if a.active != nil {
+		messages = slices.Clone(a.active.messages)
 	}
+	a.mu.Unlock()
 	events = append(events, AgentEvent{Type: EvTurnEnd, Message: failure, ToolResults: []ai.ToolResultMessage{}}, AgentEvent{Type: EvAgentEnd, Messages: messages})
 	for _, e := range events {
 		if err := emit(e); err != nil {
@@ -682,6 +696,16 @@ func (a *Agent) releaseRun(run *activeRun) {
 // executeClaimedRun runs the executor for an already-claimed run slot.
 func (a *Agent) executeClaimedRun(run *activeRun, executor func(ctx context.Context)) error {
 	ctx := run.ctx
+	defer func() {
+		a.mu.Lock()
+		a.state.IsStreaming = false
+		a.state.StreamingMessage = nil
+		a.state.PendingToolCalls = map[string]bool{}
+		a.active = nil
+		a.mu.Unlock()
+		run.cancel()
+		close(run.done)
+	}()
 
 	a.mu.Lock()
 	a.state.IsStreaming = true
@@ -718,14 +742,6 @@ func (a *Agent) executeClaimedRun(run *activeRun, executor func(ctx context.Cont
 		executor(ctx)
 	}()
 
-	a.mu.Lock()
-	a.state.IsStreaming = false
-	a.state.StreamingMessage = nil
-	a.state.PendingToolCalls = map[string]bool{}
-	a.active = nil
-	a.mu.Unlock()
-	run.cancel()
-	close(run.done)
 	return runErr
 }
 
@@ -749,7 +765,12 @@ func (a *Agent) eventSink(ctx context.Context, checked bool) EventSink {
 			a.state.StreamingMessage = event.Message
 		case EvMessageEnd:
 			a.state.StreamingMessage = nil
-			a.state.Messages = append(a.state.Messages, event.Message)
+			if checked {
+				a.state.Messages = append(a.state.Messages, event.Message)
+				if a.active != nil {
+					a.active.messages = append(a.active.messages, event.Message)
+				}
+			}
 		case EvToolExecutionStart:
 			// Copy-on-write (pi agent.ts:524-529, `new Set(...)`): State()'s
 			// shallow copy hands out an immutable snapshot, never the live map.
