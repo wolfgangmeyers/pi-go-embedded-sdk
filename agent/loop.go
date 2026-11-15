@@ -53,21 +53,14 @@ func mustEmit(emit EventSink, e AgentEvent) {
 }
 
 // AgentLoop starts an agent loop with new prompt messages, returning a stream of
-// AgentEvents whose final result is the list of new messages produced.
+// AgentEvents whose final result is the list of new messages produced. Fatal
+// loop failures produce a terminal assistant error message and lifecycle events;
+// cancellation uses StopAborted. Previously completed messages are retained.
 func AgentLoop(ctx context.Context, prompts []AgentMessage, agentCtx AgentContext, config AgentLoopConfig, streamFn StreamFn) *ai.EventStream[AgentEvent, []AgentMessage] {
 	stream := newAgentStream()
-	go func() {
-		// The low-level loop has no failure-turn synthesis (that lives in the
-		// Agent wrapper, matching pi). Recover so a listener error / panic ends
-		// the stream instead of crashing the goroutine; pi rejects the returned
-		// promise in the equivalent case.
-		defer func() { _ = recover() }()
-		messages := runAgentLoop(ctx, prompts, agentCtx, config, func(e AgentEvent) error {
-			stream.Push(e)
-			return nil
-		}, streamFn)
-		stream.End(messages)
-	}()
+	go runPublicLoop(ctx, config, stream, func(emit EventSink) []AgentMessage {
+		return runAgentLoop(ctx, prompts, agentCtx, config, emit, streamFn)
+	})
 	return stream
 }
 
@@ -81,15 +74,53 @@ func AgentLoopContinue(ctx context.Context, agentCtx AgentContext, config AgentL
 		return nil, errors.New("Cannot continue from message role: assistant")
 	}
 	stream := newAgentStream()
-	go func() {
-		defer func() { _ = recover() }()
-		messages := runAgentLoopContinue(ctx, agentCtx, config, func(e AgentEvent) error {
-			stream.Push(e)
-			return nil
-		}, streamFn)
-		stream.End(messages)
-	}()
+	go runPublicLoop(ctx, config, stream, func(emit EventSink) []AgentMessage {
+		return runAgentLoopContinue(ctx, agentCtx, config, emit, streamFn)
+	})
 	return stream, nil
+}
+
+// runPublicLoop translates fatal loop unwinds into the same failure lifecycle
+// used by Agent. MessageEnd events are the authoritative completed messages.
+func runPublicLoop(ctx context.Context, config AgentLoopConfig, stream *ai.EventStream[AgentEvent, []AgentMessage], run func(EventSink) []AgentMessage) {
+	var mu sync.Mutex
+	var messages []AgentMessage
+	emit := func(e AgentEvent) error {
+		mu.Lock()
+		defer mu.Unlock()
+		if e.Type == EvMessageEnd {
+			messages = append(messages, e.Message)
+		}
+		stream.Push(e)
+		return nil
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			msg := panicMessage(r)
+			switch v := r.(type) {
+			case toolAdmissionAbort:
+				msg = v.err.Error()
+			case emitPanic:
+				msg = v.err.Error()
+			}
+			stop := ai.StopError
+			if aborted(ctx) {
+				stop = ai.StopAborted
+			}
+			failure := &ai.AssistantMessage{Content: ai.ContentList{ai.TextContent{Text: ""}}, Usage: emptyUsage, StopReason: stop, ErrorMessage: msg, Timestamp: nowMillis()}
+			if config.Model != nil {
+				failure.Api = ai.Api(config.Model.Api)
+				failure.Provider = ai.ProviderId(config.Model.Provider)
+				failure.Model = config.Model.ID
+			}
+			_ = emit(AgentEvent{Type: EvMessageStart, Message: failure})
+			_ = emit(AgentEvent{Type: EvMessageEnd, Message: failure})
+			_ = emit(AgentEvent{Type: EvTurnEnd, Message: failure, ToolResults: []ai.ToolResultMessage{}})
+			_ = emit(AgentEvent{Type: EvAgentEnd, Messages: messages})
+		}
+		stream.End()
+	}()
+	stream.End(run(emit))
 }
 
 func newAgentStream() *ai.EventStream[AgentEvent, []AgentMessage] {
