@@ -20,6 +20,7 @@ import (
 // a recorded ruling rather than stand on its own.
 var allowedModules = map[string]string{
 	"golang.org/x/image": "BMP/WebP decoder registration (coding/imageresize.go)",
+	"golang.org/x/sys":   "Unix poll and non-reaping exit observation for safe bounded bash output drains (coding/bash_drain_unix.go, bash_exit_*.go)",
 	"golang.org/x/text":  "collation and Unicode normalization (coding/tools.go, coding/editmatch.go), and JavaScript's toLowerCase (internal/jstext/lower.go)",
 }
 

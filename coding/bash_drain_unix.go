@@ -78,35 +78,38 @@ func drainBashPipeWithOpsFinish(cmd *exec.Cmd, pr *os.File, w io.Writer, ops bas
 	if err != nil {
 		return failSetup(fmt.Errorf("bash output wake pipe: %w", err))
 	}
-	var exitAt atomic.Int64
+	var exitAt atomic.Pointer[time.Time]
 	done := make(chan error, 1)
 	go func() {
 		defer pr.Close()
 		defer wakeRead.Close()
 		buf := make([]byte, 32*1024)
-		var deadline time.Time
+		var deadline, limit time.Time
 		exited := false
 		for {
 			if !exited {
-				if ns := exitAt.Load(); ns != 0 {
+				if at := exitAt.Load(); at != nil {
 					exited = true
-					deadline = time.Unix(0, ns).Add(bashExitStdioGrace)
+					deadline = at.Add(bashExitStdioGrace)
+					limit = at.Add(bashExitStdioLimit)
 				}
 			}
-			// One final nonblocking read preserves a buffered tail if a callback
-			// ran past the deadline, without following an active writer forever.
-			expired := exited && !time.Now().Before(deadline)
+			// A final read preserves a buffered tail after a slow callback.
+			hardExpired := exited && !time.Now().Before(limit)
 			n, err := ops.read(fd, buf)
 			if n > 0 {
 				_, _ = w.Write(buf[:n])
-				if expired {
-					done <- nil
+				if hardExpired {
+					done <- drainFailure(ErrBashOutputIncomplete)
 					return
+				}
+				if exited {
+					deadline = time.Now().Add(bashExitStdioGrace)
 				}
 				continue
 			}
-			if expired && (errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EWOULDBLOCK)) {
-				done <- nil
+			if hardExpired && (errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EWOULDBLOCK)) {
+				done <- drainFailure(ErrBashOutputIncomplete)
 				return
 			}
 			if err == nil {
@@ -122,8 +125,16 @@ func drainBashPipeWithOpsFinish(cmd *exec.Cmd, pr *os.File, w io.Writer, ops bas
 			}
 			timeout := -1
 			if exited {
-				remaining := time.Until(deadline)
+				until := deadline
+				if limit.Before(until) {
+					until = limit
+				}
+				remaining := time.Until(until)
 				if remaining <= 0 {
+					if !time.Now().Before(limit) {
+						done <- drainFailure(ErrBashOutputIncomplete)
+						return
+					}
 					done <- nil
 					return
 				}
@@ -151,7 +162,9 @@ func drainBashPipeWithOpsFinish(cmd *exec.Cmd, pr *os.File, w io.Writer, ops bas
 			}
 			if !exited && fds[1].Revents != 0 {
 				exited = true
-				deadline = time.Unix(0, exitAt.Load()).Add(bashExitStdioGrace)
+				at := exitAt.Load()
+				deadline = at.Add(bashExitStdioGrace)
+				limit = at.Add(bashExitStdioLimit)
 			}
 		}
 	}()
@@ -160,7 +173,8 @@ func drainBashPipeWithOpsFinish(cmd *exec.Cmd, pr *os.File, w io.Writer, ops bas
 	exited := make(chan error, 1)
 	go func() {
 		err := observeBashExit(cmd.Process.Pid)
-		exitAt.Store(time.Now().UnixNano())
+		now := time.Now()
+		exitAt.Store(&now)
 		exited <- err
 	}()
 	var drainErr error
@@ -172,12 +186,12 @@ func drainBashPipeWithOpsFinish(cmd *exec.Cmd, pr *os.File, w io.Writer, ops bas
 		}
 		_ = wakeWrite.Close()
 		readErr := <-done
-		if readErr != nil {
+		if readErr != nil && !errors.Is(readErr, ErrBashOutputIncomplete) {
 			stopBashOnDrainFailure(cmd)
 		}
 		drainErr = errors.Join(drainErr, readErr)
 	case drainErr = <-done:
-		if drainErr != nil {
+		if drainErr != nil && !errors.Is(drainErr, ErrBashOutputIncomplete) {
 			stopBashOnDrainFailure(cmd)
 		}
 		if err := <-exited; err != nil {

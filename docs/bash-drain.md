@@ -1,20 +1,19 @@
 # Bash output and process lifetime
 
-On Linux and macOS, the SDK observes shell exit without reaping the shell. It
-keeps reading merged stdout/stderr until EOF or one second after exit is
-observed, whichever comes first. At the deadline it makes at most one final
-32 KiB read. Output arriving later can be lost; continuous descendant output
-cannot extend the window. A slow or blocked synchronous output callback can
-extend it, and may cause more buffered output to be discarded.
+On Linux and macOS, the SDK observes shell exit without reaping. It reads merged
+stdout/stderr until EOF or 100 ms of post-exit inactivity. Output resets the idle
+timer. Active output can continue beyond one second, but at two seconds after
+exit observation the drain closes the pipe and returns `ErrBashOutputIncomplete`
+if EOF has not been observed. This reports possible truncation even when no bytes
+are immediately available. A final read preserves some buffered output; a slow
+or blocked synchronous callback can delay completion and cannot be interrupted.
 
-The unreaped shell reserves its PID while the drain runs. Cancellation and
-output-read failures can therefore signal its process group without targeting a
-reused group; cancellation is disabled before reaping. Cancellation after shell
-exit remains effective while draining. Normal completion does not kill
-background descendants; closing the pipe may cause writers to receive SIGPIPE.
+The unreaped shell reserves its PID while draining. Cancellation and read
+failures can signal its process group without targeting a reused group. The hard
+limit itself does not kill descendants; closing the pipe can cause SIGPIPE.
+Cancellation remains effective during drain, and abort or timeout classification
+wins over the incomplete-output error. Cancellation is disabled before reaping.
 Processes that escape the group are not covered by group cancellation.
 
 Linux uses waitid with WNOWAIT; macOS uses kqueue NOTE_EXIT. Other platforms
-retain their existing fallback drain behavior. This deliberately differs from
-upstream's rearming idle grace: a fixed window trades potentially truncated
-late output and up to one second of latency for a bounded active drain.
+retain the original 100 ms rearming idle fallback without the hard limit.

@@ -1109,10 +1109,9 @@ func bashWallTimeSeconds(elapsed time.Duration) float64 {
 
 const bashUpdateThrottle = 100 * time.Millisecond
 
-// After shell exit, capture descendant output for at most this fixed window.
-// EOF releases immediately; a continuously writing descendant cannot extend it.
-// A synchronous output callback can still delay completion.
-const bashExitStdioGrace = time.Second
+// Quiet inherited pipes retain the upstream idle grace. Unix also bounds active drains.
+const bashExitStdioGrace = 100 * time.Millisecond
+const bashExitStdioLimit = 2 * time.Second
 
 // runBashCommand merges stdout and stderr and drains them after shell exit.
 func runBashCommand(cmd *exec.Cmd, w io.Writer) error {

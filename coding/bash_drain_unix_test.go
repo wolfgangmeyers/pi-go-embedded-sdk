@@ -146,7 +146,7 @@ func TestBashDrainContinuousDescendantIsBounded(t *testing.T) {
 	cmd.Cancel = func() error { return killProcessTree(cmd) }
 	start := time.Now()
 	err := runBashCommand(cmd, writerFunc(func(p []byte) (int, error) { return len(p), nil }))
-	if err != nil || time.Since(start) > 4*time.Second {
+	if !errors.Is(err, ErrBashOutputIncomplete) || time.Since(start) > 4*time.Second {
 		t.Fatalf("err %v elapsed %v", err, time.Since(start))
 	}
 }
@@ -173,5 +173,49 @@ func TestBashDrainCancelAfterParentExit(t *testing.T) {
 	case <-done:
 	case <-time.After(3 * time.Second):
 		t.Fatal("cancellation did not finish drain")
+	}
+}
+
+func TestBashDrainActiveBeyondOneSecond(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "sh", "-c", `(for i in $(seq 1 25); do printf x; sleep .05; done; printf END) & exit 0`)
+	var out bytes.Buffer
+	err := runBashCommand(cmd, &out)
+	if err != nil || !strings.Contains(out.String(), "END") {
+		t.Fatalf("output %q, error %v", out.String(), err)
+	}
+}
+
+func TestBashDrainLimitReportedByOperations(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+	ops := LocalBashOperations(bashShellConfig)
+	code, err := ops.Exec(ctx, `(while :; do printf x; done) & exit 0`, t.TempDir(), BashExecOptions{Env: os.Environ()})
+	if code != nil || !errors.Is(err, ErrBashOutputIncomplete) {
+		t.Fatalf("code %v error %v", code, err)
+	}
+}
+
+func TestBashDrainCancellationClassificationAfterExit(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ops := LocalBashOperations(bashShellConfig)
+	ready := make(chan struct{})
+	var once sync.Once
+	done := make(chan error, 1)
+	go func() {
+		_, err := ops.Exec(ctx, `(while :; do printf x; done) & exit 0`, t.TempDir(), BashExecOptions{Env: os.Environ(), OnData: func([]byte) { once.Do(func() { close(ready) }) }})
+		done <- err
+	}()
+	<-ready
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrShellAborted) {
+			t.Fatalf("error %v", err)
+		}
+	case <-time.After(4 * time.Second):
+		t.Fatal("cancellation did not complete")
 	}
 }
