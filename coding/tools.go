@@ -1113,8 +1113,8 @@ const bashUpdateThrottle = 100 * time.Millisecond
 // after the process exits. A detached descendant can hold the pipe open and keep
 // writing past exit; we must not destroy the stream on a fixed deadline measured
 // from exit or its tail is silently lost (port of pi#5303 / 3fa40956). Instead
-// the timer is re-armed on every chunk, so an actively writing pipe keeps us
-// reading while a quiet held-open handle still releases after the grace elapses.
+// the read deadline is re-armed after each chunk is processed, so processing
+// time cannot consume the idle window while a quiet pipe still releases promptly.
 const bashExitStdioGrace = 100 * time.Millisecond
 
 // runBashCommand starts cmd with stdout+stderr merged onto a single pipe (2>&1
@@ -1140,22 +1140,24 @@ func runBashCommand(cmd *exec.Cmd, w io.Writer) error {
 	// The parent must drop its write end or pr never sees EOF.
 	pw.Close()
 
-	// The reader goroutine feeds w and reports each chunk (and final EOF) on
-	// chunks. Closing pr unblocks a read parked on a pipe a descendant still
-	// holds open.
-	chunks := make(chan struct{}, 1)
+	// A deadline applies only to a blocked read, not to time spent processing a
+	// chunk in w. Once the process exits, re-arm it after every write so buffered
+	// output is drained even when the consumer is slow.
+	var deadlineMu sync.Mutex
+	exited := false
 	readDone := make(chan struct{})
 	go func() {
 		defer close(readDone)
 		buf := make([]byte, 32*1024)
 		for {
+			deadlineMu.Lock()
+			if exited {
+				pr.SetReadDeadline(time.Now().Add(bashExitStdioGrace))
+			}
+			deadlineMu.Unlock()
 			n, rerr := pr.Read(buf)
 			if n > 0 {
 				w.Write(buf[:n])
-			}
-			select {
-			case chunks <- struct{}{}:
-			default:
 			}
 			if rerr != nil {
 				return
@@ -1164,33 +1166,14 @@ func runBashCommand(cmd *exec.Cmd, w io.Writer) error {
 	}()
 
 	waitErr := cmd.Wait()
-
-	// Process has exited. Drain any output still arriving, re-arming the idle
-	// grace per chunk; release on idle-grace OR pipe EOF (reader done).
-	timer := time.NewTimer(bashExitStdioGrace)
-	defer timer.Stop()
-drain:
-	for {
-		select {
-		case <-readDone:
-			break drain
-		case <-chunks:
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
-			timer.Reset(bashExitStdioGrace)
-		case <-timer.C:
-			break drain
-		}
-	}
-	// Stop tracking the (possibly still-open) inherited handle and unblock the
-	// reader. The reader appends only what it has already read, so output isn't
-	// double-counted.
-	pr.Close()
+	// Wake a read already blocked on a pipe held by a quiet descendant. The
+	// reader renews this deadline after processing any data it has received.
+	deadlineMu.Lock()
+	exited = true
+	pr.SetReadDeadline(time.Now().Add(bashExitStdioGrace))
+	deadlineMu.Unlock()
 	<-readDone
+	pr.Close()
 	return waitErr
 }
 
