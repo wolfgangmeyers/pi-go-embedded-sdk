@@ -109,11 +109,11 @@ func TestSteeringMidToolBatchSkipsRemainingToolsAndInvokesModel(t *testing.T) {
 	if !toolACalled.Load() {
 		t.Fatal("expected toolA to be called")
 	}
-	if toolBCalled.Load() {
-		t.Fatal("toolB should NOT have been called because steering arrived")
+	if !toolBCalled.Load() {
+		t.Fatal("expected toolB to be called")
 	}
-	if toolCCalled.Load() {
-		t.Fatal("toolC should NOT have been called because steering arrived")
+	if !toolCCalled.Load() {
+		t.Fatal("expected toolC to be called")
 	}
 
 	if len(requests) != 2 {
@@ -153,11 +153,11 @@ func TestSteeringMidToolBatchSkipsRemainingToolsAndInvokesModel(t *testing.T) {
 	if resA == nil || resA.IsError {
 		t.Fatalf("expected resA to be non-error, got: %+v", resA)
 	}
-	if resB == nil || !resB.IsError || !strings.Contains(trText(*resB), "interrupted by user steering message") {
-		t.Fatalf("expected resB to be skipped with steering message, got: %+v", resB)
+	if resB == nil || resB.IsError || strings.Contains(trText(*resB), "interrupted by user steering message") {
+		t.Fatalf("expected resB to succeed, got: %+v", resB)
 	}
-	if resC == nil || !resC.IsError || !strings.Contains(trText(*resC), "interrupted by user steering message") {
-		t.Fatalf("expected resC to be skipped with steering message, got: %+v", resC)
+	if resC == nil || resC.IsError || strings.Contains(trText(*resC), "interrupted by user steering message") {
+		t.Fatalf("expected resC to succeed, got: %+v", resC)
 	}
 	if steeringUser == nil {
 		t.Fatal("expected steering user message to be present in request 2")
@@ -225,20 +225,21 @@ func TestSteeringBeforeToolExecutionSkipsAllToolsAndInvokesModel(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if toolACalled.Load() {
-		t.Fatal("toolA should NOT have been called because steering arrived before execution")
+	if !toolACalled.Load() {
+		t.Fatal("expected toolA to be called")
 	}
-	if toolBCalled.Load() {
-		t.Fatal("toolB should NOT have been called because steering arrived before execution")
+	if !toolBCalled.Load() {
+		t.Fatal("expected toolB to be called")
 	}
 
 	if len(requests) != 2 {
 		t.Fatalf("expected 2 requests, got %d", len(requests))
 	}
 
-	// Verify both tool results are skipped error results
+	// Verify both tool results are clean non-error results
 	req2Messages := requests[1].Messages
 	var resA, resB *ai.ToolResultMessage
+	var steeringUser *ai.UserMessage
 	for _, m := range req2Messages {
 		if tr, ok := m.(ai.ToolResultMessage); ok {
 			switch tr.ToolCallID {
@@ -249,14 +250,22 @@ func TestSteeringBeforeToolExecutionSkipsAllToolsAndInvokesModel(t *testing.T) {
 				copyTR := tr
 				resB = &copyTR
 			}
+		} else if u, ok := m.(ai.UserMessage); ok {
+			if strings.Contains(userText(u), "immediate steering before tools") {
+				copyU := u
+				steeringUser = &copyU
+			}
 		}
 	}
 
-	if resA == nil || !resA.IsError || !strings.Contains(trText(*resA), "interrupted by user steering message") {
-		t.Fatalf("expected resA to be skipped, got: %+v", resA)
+	if resA == nil || resA.IsError || strings.Contains(trText(*resA), "interrupted by user steering message") {
+		t.Fatalf("expected resA to succeed cleanly, got: %+v", resA)
 	}
-	if resB == nil || !resB.IsError || !strings.Contains(trText(*resB), "interrupted by user steering message") {
-		t.Fatalf("expected resB to be skipped, got: %+v", resB)
+	if resB == nil || resB.IsError || strings.Contains(trText(*resB), "interrupted by user steering message") {
+		t.Fatalf("expected resB to succeed cleanly, got: %+v", resB)
+	}
+	if steeringUser == nil {
+		t.Fatal("expected steering user message to be delivered in request 2")
 	}
 }
 
@@ -376,11 +385,11 @@ func TestSteeringMidToolBatchWithSequentialOptionAbortsRemainingTools(t *testing
 	if !toolACalled.Load() {
 		t.Fatal("expected toolA to be called")
 	}
-	if toolBCalled.Load() {
-		t.Fatal("toolB should NOT have been called because steering arrived")
+	if !toolBCalled.Load() {
+		t.Fatal("expected toolB to be called")
 	}
-	if toolCCalled.Load() {
-		t.Fatal("toolC should NOT have been called because steering arrived")
+	if !toolCCalled.Load() {
+		t.Fatal("expected toolC to be called")
 	}
 
 	if len(requests) != 2 {
@@ -388,7 +397,7 @@ func TestSteeringMidToolBatchWithSequentialOptionAbortsRemainingTools(t *testing
 	}
 
 	// Verify tool results in request 2:
-	// toolA succeeded, toolB and toolC were aborted as interrupted
+	// toolA, toolB and toolC all succeeded
 	req2Messages := requests[1].Messages
 	var resA, resB, resC *ai.ToolResultMessage
 	for _, m := range req2Messages {
@@ -410,11 +419,11 @@ func TestSteeringMidToolBatchWithSequentialOptionAbortsRemainingTools(t *testing
 	if resA == nil || resA.IsError {
 		t.Fatalf("expected resA to be non-error, got: %+v", resA)
 	}
-	if resB == nil || !resB.IsError || !strings.Contains(trText(*resB), "interrupted by user steering message") {
-		t.Fatalf("expected resB to be aborted with steering message, got: %+v", resB)
+	if resB == nil || resB.IsError || strings.Contains(trText(*resB), "interrupted by user steering message") {
+		t.Fatalf("expected resB to succeed, got: %+v", resB)
 	}
-	if resC == nil || !resC.IsError || !strings.Contains(trText(*resC), "interrupted by user steering message") {
-		t.Fatalf("expected resC to be aborted with steering message, got: %+v", resC)
+	if resC == nil || resC.IsError || strings.Contains(trText(*resC), "interrupted by user steering message") {
+		t.Fatalf("expected resC to succeed, got: %+v", resC)
 	}
 
 	// Verify HasSteeringMessages method on Agent returns false after being handled
@@ -487,7 +496,7 @@ func TestSteeringMidToolBatchParallelExecutionAbortsRemainingTools(t *testing.T)
 	if !toolACalled.Load() {
 		t.Fatal("expected toolA to be called")
 	}
-	if toolBCalled.Load() {
-		t.Fatal("toolB should NOT have been called because steering arrived")
+	if !toolBCalled.Load() {
+		t.Fatal("expected toolB to be called")
 	}
 }

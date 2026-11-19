@@ -107,8 +107,8 @@ func TestCodingSessionMultiToolInterruptedBySteering(t *testing.T) {
 	if !tool1Called.Load() {
 		t.Fatal("expected tool1 to be executed")
 	}
-	if tool2Called.Load() {
-		t.Fatal("tool2 MUST NOT be executed because steering arrived mid-batch!")
+	if !tool2Called.Load() {
+		t.Fatal("expected tool2 to be executed")
 	}
 
 	if !strings.Contains(res.Text, "received your steering message immediately") {

@@ -645,20 +645,6 @@ func interruptedToolOutcome(tc ai.ToolCall) AgentToolCallOutcome {
 
 func executeToolCalls(ctx context.Context, current *AgentContext, msg *ai.AssistantMessage, config AgentLoopConfig, emit EventSink) executedBatch {
 	toolCalls := filterToolCalls(msg)
-	if config.HasSteeringMessages != nil && config.HasSteeringMessages() {
-		var finalized []AgentToolCallOutcome
-		var messages []ai.ToolResultMessage
-		for _, tc := range toolCalls {
-			mustEmit(emit, AgentEvent{Type: EvToolExecutionStart, ToolCallID: tc.ID, ToolName: tc.Name, Args: tc.Arguments})
-			fo := interruptedToolOutcome(tc)
-			emitToolExecutionEnd(fo, emit)
-			trm := createToolResultMessage(fo)
-			emitToolResultMessage(trm, emit)
-			finalized = append(finalized, fo)
-			messages = append(messages, trm)
-		}
-		return executedBatch{messages: messages, terminate: false}
-	}
 	hasSequential := false
 	for _, tc := range toolCalls {
 		if t, ok := findTool(current.Tools, tc.Name); ok && t.ExecutionMode == ToolSequential {
@@ -691,27 +677,7 @@ func executeToolCallsSequential(ctx context.Context, current *AgentContext, msg 
 	var finalized []AgentToolCallOutcome
 	var messages []ai.ToolResultMessage
 
-	hasSteering := func() bool {
-		if config.HasSteeringMessages != nil {
-			return config.HasSteeringMessages()
-		}
-		return false
-	}
-
-	for i, tc := range toolCalls {
-		if hasSteering() {
-			for _, remaining := range toolCalls[i:] {
-				mustEmit(emit, AgentEvent{Type: EvToolExecutionStart, ToolCallID: remaining.ID, ToolName: remaining.Name, Args: remaining.Arguments})
-				fo := interruptedToolOutcome(remaining)
-				emitToolExecutionEnd(fo, emit)
-				trm := createToolResultMessage(fo)
-				emitToolResultMessage(trm, emit)
-				finalized = append(finalized, fo)
-				messages = append(messages, trm)
-			}
-			break
-		}
-
+	for _, tc := range toolCalls {
 		mustEmit(emit, AgentEvent{Type: EvToolExecutionStart, ToolCallID: tc.ID, ToolName: tc.Name, Args: tc.Arguments})
 
 		prep := prepareToolCall(ctx, current, msg, tc, config.toolCallHooks(), current.Tools)
@@ -820,32 +786,28 @@ func executeAdmittedCallsParallelWithPublication(ctx context.Context, current *A
 	count := 0
 	for i, tc := range calls {
 		checkFatal()
-		interrupted := config.HasSteeringMessages != nil && config.HasSteeringMessages()
+		if config.HasSteeringMessages != nil {
+			config.HasSteeringMessages()
+		}
 		checkFatal()
 		mustEmit(safeEmit, AgentEvent{Type: EvToolExecutionStart, ToolCallID: tc.ID, ToolName: tc.Name, Args: tc.Arguments})
 		checkFatal()
-		var prep prepareResult
-		if !interrupted {
-			// This check is the admission reservation: it is ordered with fatal
-			// publication under fatalMu. Once reserved, the hook and replay run
-			// without that lock and a later fatal cannot revoke the reservation.
-			prep = prepareToolCall(ctx, current, msg, tc, hooks, current.Tools)
-		}
+		// This check is the admission reservation: it is ordered with fatal
+		// publication under fatalMu. Once reserved, the hook and replay run
+		// without that lock and a later fatal cannot revoke the reservation.
+		prep := prepareToolCall(ctx, current, msg, tc, hooks, current.Tools)
 		count++
-		if interrupted || prep.immediate != nil || prep.replay != nil {
+		if prep.immediate != nil || prep.replay != nil {
 			checkFatal()
 			var fo AgentToolCallOutcome
-			switch {
-			case interrupted:
-				fo = interruptedToolOutcome(tc)
-			case prep.immediate != nil:
+			if prep.immediate != nil {
 				fo = AgentToolCallOutcome{ToolCall: tc, Result: prep.immediate.result, IsError: prep.immediate.isError}
-			default:
+			} else {
 				fo = replayOutcome(tc, prep.replay)
 			}
 			outcomes[i] = fo
 			emitToolExecutionEnd(fo, safeEmit)
-			if aborted(ctx) && !interrupted {
+			if aborted(ctx) {
 				break
 			}
 			continue
@@ -977,12 +939,6 @@ func executeToolCallsParallel(ctx context.Context, current *AgentContext, msg *a
 	// finalize, so AfterToolCall never runs for it; deciding here also keeps those
 	// end events in slot order, as pi's synchronous map does.
 	batchAborted := aborted(ctx)
-	hasSteering := func() bool {
-		if config.HasSteeringMessages != nil {
-			return config.HasSteeringMessages()
-		}
-		return false
-	}
 
 	for i, s := range slots {
 		if s.immediate != nil {
@@ -1006,19 +962,6 @@ func executeToolCallsParallel(ctx context.Context, current *AgentContext, msg *a
 			ordered[i] = fo
 			continue
 		}
-		if hasSteering() {
-			fo := interruptedToolOutcome(s.toolCall)
-			func() {
-				defer func() {
-					if r := recover(); r != nil {
-						panicOnce.Do(func() { panicVal = r })
-					}
-				}()
-				emitToolExecutionEnd(fo, safeEmit)
-			}()
-			ordered[i] = fo
-			continue
-		}
 		wg.Add(1)
 		go func(i int, s slot) {
 			defer wg.Done()
@@ -1027,12 +970,6 @@ func executeToolCallsParallel(ctx context.Context, current *AgentContext, msg *a
 					panicOnce.Do(func() { panicVal = r })
 				}
 			}()
-			if hasSteering() {
-				fo := interruptedToolOutcome(s.toolCall)
-				emitToolExecutionEnd(fo, safeEmit)
-				ordered[i] = fo
-				return
-			}
 			ordered[i] = s.thunk()
 		}(i, s)
 	}

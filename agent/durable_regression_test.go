@@ -43,7 +43,7 @@ func TestDurableAdmissionDoesNotRunAheadOfSteering(t *testing.T) {
 		return nil
 	}, HasSteeringMessages: func() bool { return steering }}
 	executeToolCalls(context.Background(), &AgentContext{Tools: []AgentTool{tool}}, msg, config, func(AgentEvent) error { return nil })
-	if len(admitted) != 1 || len(executed) != 1 || admitted[0] != "one" || executed[0] != "one" {
+	if !reflect.DeepEqual(admitted, []string{"one", "two"}) || !reflect.DeepEqual(executed, []string{"one", "two"}) {
 		t.Fatalf("admitted=%v executed=%v", admitted, executed)
 	}
 }
@@ -101,10 +101,10 @@ func TestParallelSteeringSkipsOnlyUnadmittedCalls(t *testing.T) {
 			return nil
 		},
 	}, func(AgentEvent) error { return nil })
-	if !reflect.DeepEqual(admitted, []string{"one"}) || len(executed) != 1 || <-executed != "one" {
+	if !reflect.DeepEqual(admitted, []string{"one", "two"}) || len(executed) != 2 {
 		t.Fatalf("admitted=%v executed count=%d", admitted, len(executed))
 	}
-	if len(batch.messages) != 2 || batch.messages[0].IsError || !batch.messages[1].IsError {
+	if len(batch.messages) != 2 || batch.messages[0].IsError || batch.messages[1].IsError {
 		t.Fatalf("results=%+v", batch.messages)
 	}
 }
