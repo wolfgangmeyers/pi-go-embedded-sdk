@@ -632,6 +632,7 @@ func failToolCallsFromTruncatedMessage(toolCalls []ai.ToolCall, emit EventSink) 
 	return executedBatch{messages: messages, terminate: false}
 }
 
+// Deprecated: retained for compatibility; mid-batch tool calls are no longer interrupted by steering.
 func interruptedToolOutcome(tc ai.ToolCall) AgentToolCallOutcome {
 	return AgentToolCallOutcome{
 		ToolCall: tc,
@@ -706,8 +707,8 @@ func executeToolCallsSequential(ctx context.Context, current *AgentContext, msg 
 }
 
 // executeAdmittedCallsParallel commits each call to execution immediately after
-// admission. Steering can skip only calls that have not yet been admitted. Once
-// admitted, a call must settle even if steering or cancellation arrives later.
+// admission. In-flight and batched tool calls complete to their natural outcome
+// without steering interruption; steering is delivered on the subsequent turn.
 func executeAdmittedCallsParallel(ctx context.Context, current *AgentContext, msg *ai.AssistantMessage, calls []ai.ToolCall, config AgentLoopConfig, emit EventSink) executedBatch {
 	return executeAdmittedCallsParallelWithPublication(ctx, current, msg, calls, config, emit, nil)
 }
@@ -786,6 +787,7 @@ func executeAdmittedCallsParallelWithPublication(ctx context.Context, current *A
 	count := 0
 	for i, tc := range calls {
 		checkFatal()
+		// Retain HasSteeringMessages hook evaluation for synchronization hooks (e.g. fatal checks).
 		if config.HasSteeringMessages != nil {
 			config.HasSteeringMessages()
 		}
